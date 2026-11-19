@@ -14,6 +14,7 @@ Inputs (env, defaults under GBOS_ROOT):
                      (software KeyMint, Cuttlefish composer, Venus/VirGL, boot control, ...)
   GBOS_LIBZ          baseline libz.so (vm-amd/zlib-build)
   GBOS_POINTER_BRIDGE  pointer-bridge/vm-pointer-bridge
+  GBOS_FUTILITY_STUB   layer/stubs/out/futility (layer/stubs/build.sh)
 """
 import json
 import os
@@ -31,6 +32,7 @@ STOCK_IMAGE = Path(os.environ.get('GBOS_STOCK_IMAGE', LINUX_DIR / 'android-deskt
 PORT_IMAGE = Path(os.environ.get('GBOS_PORT_IMAGE', LINUX_DIR / 'image-security/googlebook-security.bin'))
 LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
 POINTER_BRIDGE = Path(os.environ.get('GBOS_POINTER_BRIDGE', HERE.parents[1] / 'pointer-bridge/vm-pointer-bridge'))
+FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futility'))
 SUPER_BASE = 1458176 * 512
 PARTITION_NAME = 'gbos_layer'
 
@@ -59,7 +61,8 @@ on property:sys.boot_completed=1
 
 FAKE_BATTERY_RC = (
     b'# gbos: no ChromeOS EC in a VM, so the battery reads 0% and setup refuses to continue.\n'
-    b'# The fake values live in system_server; re-apply them whenever zygote comes back.\n'
+    b'# The fake values live in system_server; re-apply them whenever zygote comes back (and before\n'
+    b'# boot_completed: the setup wizard checks the battery early). The loop waits for BatteryService.\n'
     b'service vm-fake-battery /system/bin/sh -c "for i in $$(seq 1 60); do cmd battery set ac 1 && break; sleep 5; done; '
     b'cmd battery set usb 0; cmd battery set status 2; cmd battery set level 100; svc power stayon true"\n'
     b'    class late_start\n'
@@ -68,7 +71,7 @@ FAKE_BATTERY_RC = (
     b'    seclabel u:r:shell:s0\n'
     b'    oneshot\n'
     b'    disabled\n\n'
-    b'on property:sys.boot_completed=1 && property:init.svc.zygote=running\n'
+    b'on property:init.svc.zygote=running\n'
     b'    start vm-fake-battery\n'
 )
 
@@ -209,6 +212,8 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
         'etc/init/vm-fake-battery.rc': (FAKE_BATTERY_RC, 'vendor_configs_file', 0o644, 0, 0),
         'etc/init/vm-pointer-bridge.rc': (POINTER_BRIDGE_RC, 'vendor_configs_file', 0o644, 0, 0),
         'bin/vm-pointer-bridge': (POINTER_BRIDGE.read_bytes(), 'gbos_pointer_bridge_exec', 0o755, 0, 2000),
+        # OTA postinstall flashes the AP firmware through futility; there is none (stubs/futility.c).
+        'bin/futility': _entry(stock_vendor, 'bin/futility', FUTILITY_STUB.read_bytes()),
     }
     return files
 
@@ -261,7 +266,7 @@ def build_disk(erofs: Path, disk: Path):
 
 def main():
     out = Path(sys.argv[1])
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE):
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE, FUTILITY_STUB):
         if not need.exists():
             raise SystemExit(f'missing {need}')
     tmp = Path(tempfile.mkdtemp(prefix='gbos-layer-', dir=out.parent))

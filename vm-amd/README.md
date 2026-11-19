@@ -9,8 +9,11 @@ vm-amd changes lives in one erofs **layer** that the first-stage fstab mounts ov
 An OTA can therefore verify and apply, and the layer applies to whichever slot boots; `run_vm.sh` reads
 the A/B state from `misc` like a bootloader and relaunches the VM after the guest reboots.
 
-Verified 2026-11-19: stock image + layer boots to the setup wizard (first boot ~165 s), pointer bridge
-up (`VM Pointer` / `VM Wheel`), ~1.5–3k emulated instructions/s with the libz bind, no unsupported opcodes.
+Verified 2026-11-19: stock image + layer boots to the setup wizard (first boot ~165 s), clicks work
+through the pointer bridge, ~1.5–3k emulated instructions/s with the libz bind, no unsupported opcodes.
+**OTA end to end**: the wizard's 164 MB update downloaded and applied in ~8 min, the guest rebooted,
+`run_vm.sh` came back up on slot `_b` with the layer on top, setup continued with `/data` intact, and
+the boot-control HAL marked `_b` successful.
 
 ## Layout (`GBOS_ROOT`, default `/mnt/dados/gbos`)
 
@@ -71,6 +74,7 @@ python3 $GBOS_ROOT/gbos-vm-linux/expand_lapis_userdata.py $GBOS_ROOT/vm/stock/go
 git clone --depth 1 https://android.googlesource.com/platform/external/zlib $GBOS_ROOT/tuned/zlib-build/src
 ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash $GBOS_ROOT/tuned/zlib-build/build.sh
 ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash pointer-bridge/build.sh
+ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash $GBOS_ROOT/tuned/layer/stubs/build.sh
 python3 $GBOS_ROOT/tuned/layer/build_layer.py $GBOS_ROOT/vm/layer.img
 python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_ROOT/vm/initrd
 ```
@@ -86,7 +90,11 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
 * Baseline `libz.so` for `/vendor/lib64`, and for `/system/lib64` through a bind mount at `early-init`:
   `/system` cannot be overlaid on a user build (fs_mgr allowlist).
 * `gscd` / `timberslide` stopped at `boot` (ChromeOS GSC / EC daemons that crash-loop in a VM).
-* Fake AC / 100 % battery, re-applied every time zygote comes up.
+* Fake AC / 100 % battery, applied as soon as zygote is up (the setup wizard checks it before
+  `boot_completed`) and again whenever zygote restarts.
+* `/vendor/bin/futility` replaced by a stub (`layer/stubs/futility.c`, `layer/stubs/build.sh`): the OTA
+  postinstall step flashes the AP firmware with `futility update`; there is no SPI flash, and the real
+  tool's failure made update_engine reject the whole update (`kPostinstallRunnerError`).
 * `vm-pointer-bridge` (usb-tablet -> clickable pointer + wheel) in its own SELinux domain.
 * `odm_sepolicy.cil` (that domain, the libz bind) plus a placeholder `/odm/etc/selinux/precompiled_sepolicy`:
   without its `.sha256` sidecars init skips the precompiled policy and compiles the CIL files, ours

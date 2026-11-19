@@ -1,6 +1,6 @@
 import unittest
 
-from build_layer import added_lines, ancestor_dirs, layer_path, odm_build_prop, prop_overrides
+from build_layer import FAKE_BATTERY_RC, added_lines, ancestor_dirs, layer_path, odm_build_prop, prop_overrides
 
 
 class PropOverridesTest(unittest.TestCase):
@@ -59,6 +59,14 @@ class AddedLinesTest(unittest.TestCase):
 
     def test_ignores_blank_lines_and_comments(self):
         self.assertEqual(added_lines("a\n", "a\n\n# note\n"), [])
+
+
+class FakeBatteryTriggerTest(unittest.TestCase):
+    def test_starts_as_soon_as_zygote_runs(self):
+        # The setup wizard checks the battery before boot_completed; the service itself retries
+        # `cmd battery` until BatteryService answers.
+        self.assertIn(b"on property:init.svc.zygote=running\n    start vm-fake-battery\n", FAKE_BATTERY_RC)
+        self.assertNotIn(b"sys.boot_completed", FAKE_BATTERY_RC)
 
 
 if __name__ == "__main__":
