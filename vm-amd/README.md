@@ -11,8 +11,7 @@ vm-amd changes lives in one erofs **layer** that the first-stage fstab mounts ov
 An OTA can therefore verify and apply, and the layer applies to whichever slot boots; `run_vm.sh` reads
 the A/B state from `misc` like a bootloader and relaunches the VM after the guest reboots.
 
-Verified 2026-11-19: stock image + layer boots to the setup wizard (first boot ~165 s), clicks work
-through the pointer bridge, ~1.5–3k emulated instructions/s with the libz bind, no unsupported opcodes.
+Verified 2026-11-19: stock image + layer boots to the setup wizard (first boot ~165 s), clicks work, ~1.5–3k emulated instructions/s with the libz bind, no unsupported opcodes.
 **OTA end to end**: the wizard's 164 MB update downloaded and applied in ~8 min, the guest rebooted,
 `run_vm.sh` came back up on slot `_b` with the layer on top, setup continued with `/data` intact, and
 the boot-control HAL marked `_b` successful. With the Fedora-driver kernel and the module layer the
@@ -30,7 +29,7 @@ SELinux failures.
 | `$GBOS_ROOT/kernel/out` | GKI-config kernel build (the CRC reference for `out-full`) |
 | `$GBOS_ROOT/kernel/out-full` | kernel with Fedora's drivers: what `run_vm.sh` boots |
 | `$GBOS_ROOT/dlkm/` | `staging` (modules_install), `vendor-modules` (the layer's `/vendor/lib/modules`), `firmware` |
-| `$GBOS_ROOT/vm/stock/googlebook.bin` | stock recovery image with userdata grown to 16 GiB |
+| `$GBOS_ROOT/vm/stock/googlebook.bin` | stock recovery image with userdata grown to 64 GiB (16 GiB filled up with the OTA and app updates) |
 | `$GBOS_ROOT/vm/layer.img` | the layer (GPT, partition `gbos_layer`), second NVMe namespace |
 | `$GBOS_ROOT/vm/initrd` | VM ramdisk with the layer entries in the first-stage fstab |
 | `$GBOS_ROOT/vm/data.qcow2` | overlay holding everything the guest writes (`/data`, misc, OTA slots) |
@@ -69,9 +68,14 @@ started, Android userspace running, boot animation on screen, boot completed. Th
 the first ~20 s (Google's virtio-gpu module sets up no framebuffer console), then shows the boot
 animation until Android is ready.
 
-`GBOS_MEM` (guest RAM, 4G), `GBOS_HOST_MEM_MAX` (cgroup cap, 7G), `GBOS_LOGLEVEL` (7 shows gfni_emu
-counters), `GBOS_ONCE=1` (no relaunch after a guest reboot), `GBOS_WACOM=1` (old Wacom tablet instead of
-usb-tablet + bridge). Serial log: `$GBOS_ROOT/vm/logs/<name>/serial.log`.
+`GBOS_SMP` (vCPUs, 8), `GBOS_MEM` (guest RAM, 8G), `GBOS_HOST_MEM_MAX` (cgroup cap, 12G), `GBOS_LOGLEVEL` (7 shows gfni_emu
+counters), `GBOS_ONCE=1` (no relaunch after a guest reboot). Serial log:
+`$GBOS_ROOT/vm/logs/<name>/serial.log`.
+
+The mouse is QEMU's `usb-mouse`, a real relative mouse for Android (cursor, hover, right click, wheel,
+acceleration): click the window to capture it, Ctrl+Alt+G releases it. The tablet + `pointer-bridge`
+path showed up as a hovering stylus, and system_server's InputDispatcher aborted (`Expected
+ACTION_HOVER_MOVE instead of MotionEvent`) when a window changed under it.
 
 ## Build from scratch
 
@@ -97,10 +101,9 @@ python3 $GBOS_ROOT/tuned/kernel/collect_firmware.py /lib/firmware $GBOS_ROOT/dlk
 
 # image inputs: gbos-vm-linux README steps 1-6 (the security-ported image is only read by build_layer.py)
 cp --sparse=always $GBOS_ROOT/gbos-vm-linux/android-desktop_signed_recovery_image.bin $GBOS_ROOT/vm/stock/googlebook.bin
-python3 $GBOS_ROOT/gbos-vm-linux/expand_lapis_userdata.py $GBOS_ROOT/vm/stock/googlebook.bin 16
+python3 $GBOS_ROOT/gbos-vm-linux/expand_lapis_userdata.py $GBOS_ROOT/vm/stock/googlebook.bin 64
 git clone --depth 1 https://android.googlesource.com/platform/external/zlib $GBOS_ROOT/tuned/zlib-build/src
 ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash $GBOS_ROOT/tuned/zlib-build/build.sh
-ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash pointer-bridge/build.sh
 ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash $GBOS_ROOT/tuned/layer/stubs/build.sh
 python3 $GBOS_ROOT/tuned/layer/build_layer.py $GBOS_ROOT/vm/layer.img
 python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_ROOT/vm/initrd
@@ -114,6 +117,8 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   `/odm/etc/build.prop` (loaded after `/vendor/build.prop`), `vendor_file_contexts` additions (device
   labels: `/dev/ttyS0`, the virtio-gpu sysfs node) -> `/odm/etc/selinux/odm_file_contexts`.
 * `ro.dalvik.vm.native.bridge=0` (libhoudini makes zygote abort silently).
+* Vulkan rendering: HWUI (`skiavk`) and SurfaceFlinger (`skiavkthreaded`) use Vulkan through Venus
+  (`vulkan.virtio.so` -> the host's Vulkan driver) instead of the security port's GL over virgl.
 * Baseline `libz.so` for `/vendor/lib64`, and for `/system/lib64` through a bind mount at `early-init`:
   `/system` cannot be overlaid on a user build (fs_mgr allowlist).
 * Boot animation: the stock one fades to black after ~5 s (enough for a real Googlebook); the layer's
@@ -136,7 +141,6 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   `/vendor/etc/gbos/system/bin/gscutil.real`) for everything else. The kept copy is made a private
   mount before the wrapper covers the original: `/system` is shared, so otherwise the wrapper's mount
   propagated onto the copy, the wrapper exec'd itself and init hung on `gscutil perform-os-startup`.
-* `vm-pointer-bridge` (usb-tablet -> clickable pointer + wheel) in its own SELinux domain.
 * **Drivers**: a `/vendor/lib/modules` directory in place of the stock symlink to
   `/vendor_dlkm/lib/modules`. ueventd (modalias handling), `init.insmod.sh` and the vendor rc files all
   read that path, so its index decides per name: our 3316 modules are files there, Google's 564 are named
@@ -189,7 +193,7 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   which `-no-reboot` turned into QEMU closing without a message. A real PC (`iTCO_wdt`, `sp5100_tco`)
   would reboot the same way.
 * **`-machine q35,i8042=off`**: Fedora's `psmouse` enables the Q35 PS/2 mouse, and QEMU then sends
-  the pointer to it instead of to usb-tablet: the pointer bridge got no events and clicks did nothing.
+  the pointer to it instead of to the USB mouse/tablet, and clicks did nothing.
   Real PCs keep `psmouse` (PS/2 touchpads).
 * Modules load only after switch_root (ueventd). Storage/USB controllers that must exist before that
   (`ahci`, NVMe is built in) work in the VM because the disk is NVMe; a real-PC image needs them in the

@@ -8,9 +8,9 @@
 # it reads the A/B state from misc, so after an OTA the VM comes back up on the new slot by itself.
 #
 # Env:
-#   GBOS_FRESH=1       start with a clean /data            GBOS_MEM=4G   GBOS_HOST_MEM_MAX=7G
+#   GBOS_FRESH=1       start with a clean /data            GBOS_SMP=8  GBOS_MEM=8G  GBOS_HOST_MEM_MAX=12G
 #   GBOS_DISPLAY_ARGS  e.g. "-display egl-headless -vnc 127.0.0.1:7"
-#   GBOS_NET_ARGS      e.g. "-nic none" for offline         GBOS_WACOM=1  Wacom tablet instead of usb-tablet
+#   GBOS_NET_ARGS      e.g. "-nic none" for offline         
 #   GBOS_LOGLEVEL      kernel console loglevel (7 shows gfni_emu counters)
 #   GBOS_ONCE=1        do not relaunch after a guest reboot
 set -eu
@@ -30,23 +30,26 @@ done
 if pgrep -x qemu-system-x86 >/dev/null; then echo "QEMU is already running" >&2; exit 1; fi
 [ "${GBOS_FRESH:-0}" = 1 ] && rm -f "$OVERLAY"
 [ -f "$OVERLAY" ] || qemu-img create -q -f qcow2 -b "$BASE" -F raw "$OVERLAY"
+# 8 of the host's 12 threads and 8 GiB by default; the host keeps the rest.
+: "${GBOS_SMP:=8}" "${GBOS_MEM:=8G}" "${GBOS_HOST_MEM_MAX:=12G}"
+NEED_MB=$(( ${GBOS_MEM%G} * 1024 + 2048 ))
 AVAIL_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
-[ "$AVAIL_MB" -ge 6000 ] || echo "warning: only ${AVAIL_MB} MB RAM available; close heavy apps first" >&2
+[ "$AVAIL_MB" -ge "$NEED_MB" ] || echo "warning: only ${AVAIL_MB} MB RAM available for a ${GBOS_MEM} guest; close heavy apps or set GBOS_MEM lower" >&2
 
 : "${GBOS_XRES:=1440}" "${GBOS_YRES:=1080}"
 : "${GBOS_GPU_ARGS:=-device virtio-gpu-gl-pci,hostmem=${GBOS_HOSTMEM:-2G},blob=true,venus=true,addr=0x1,xres=$GBOS_XRES,yres=$GBOS_YRES}"
-: "${GBOS_DISPLAY_ARGS:=-display sdl,gl=on,show-cursor=on}"
-TABLET=usb-tablet; [ "${GBOS_WACOM:-0}" = 1 ] && TABLET=usb-wacom-tablet
-: "${GBOS_INPUT_ARGS:=-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device $TABLET,bus=xhci.0}"
+: "${GBOS_DISPLAY_ARGS:=-display sdl,gl=on}"
+# usb-mouse: a real relative mouse for Android (click the window to capture it, Ctrl+Alt+G releases).
+: "${GBOS_INPUT_ARGS:=-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0}"
 : "${GBOS_NET_ARGS:=-netdev user,id=net0,ipv6=off -device virtio-net-pci,netdev=net0}"
 
 boot_once() {
   eval "$(python3 "$HERE/boot/slot.py" boot-args "$OVERLAY" "$BASE")"
   mkdir -p "$LOG"
   [ -f "$LOG/serial.log" ] && mv -f "$LOG/serial.log" "$LOG/serial.log.prev"
-  echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes); the window stays black for ~20 s, then the boot animation" >&2
+  echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes); the window stays black for ~20 s, then the boot animation; click it to capture the mouse, Ctrl+Alt+G releases it" >&2
   # i8042=off: with Fedora's psmouse loaded, the guest enables the PS/2 mouse and QEMU then sends the
-  # pointer there instead of to usb-tablet (the pointer bridge saw no events, clicks did nothing).
+  # pointer there instead of to the USB mouse.
   # cfi=norand: gfni_emu's entry stubs carry fixed kCFI hashes. overlay.gbos_caller_creds: the layer is
   # mounted before any SELinux policy exists (see the kernel patch).
   local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 panic=0 root=/dev/ram0 \
@@ -60,8 +63,8 @@ androidboot.veritymode=enforcing androidboot.vendor.apex.com.android.hardware.ke
 androidboot.vendor.boot_patchlevel=2026-09-01 androidboot.boot_patchlevel=2026-09-01 \
 androidboot.dalvik.vm.enable_uffd_gc=true androidboot.zygote.disable_gl_preload"
   # shellcheck disable=SC2086
-  systemd-run --user --scope -q -p MemoryMax="${GBOS_HOST_MEM_MAX:-7G}" -p MemorySwapMax=0 -p CPUQuota=400% \
-    timeout "${GBOS_SECS:-28800}" qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m "${GBOS_MEM:-4G}" -machine q35,i8042=off \
+  systemd-run --user --scope -q -p MemoryMax="$GBOS_HOST_MEM_MAX" -p MemorySwapMax=0 -p CPUQuota=$(( GBOS_SMP * 100 ))% \
+    timeout "${GBOS_SECS:-28800}" qemu-system-x86_64 -enable-kvm -cpu host -smp "$GBOS_SMP" -m "$GBOS_MEM" -machine q35,i8042=off \
     -nodefaults -no-reboot -kernel "$KERNEL" -initrd "$INITRD" -append "$cmd" \
     -drive if=none,id=disk,format=qcow2,file="$OVERLAY" \
     -drive if=none,id=layer,format=raw,readonly=on,file="$LAYER" \

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_layer import (ODM_SEPOLICY, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
+from build_layer import (ODM_SEPOLICY, odm_files, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
                          new_dir_meta, odm_build_prop, parse_erofs_ls, prop_overrides, tree_entries, write_tar)
 
 
@@ -85,6 +85,26 @@ class VmPowerTest(unittest.TestCase):
         self.assertIn(b"cmd settings put global stay_on_while_plugged_in 7", VM_POWER_RC)
         self.assertIn(b"cmd settings put system screen_off_timeout 2147483647", VM_POWER_RC)
         self.assertNotIn(b"svc power", VM_POWER_RC)
+
+
+class GraphicsTest(unittest.TestCase):
+    def test_apps_and_surfaceflinger_render_with_vulkan_through_venus(self):
+        # The security port renders with GL over virgl; Venus passes Vulkan to the host GPU instead.
+        prop = odm_files({"debug.hwui.renderer": "skiagl", "ro.hwui.use_vulkan": "false"}, [])["etc/build.prop"][0]
+        for line in (b"debug.hwui.renderer=skiavk", b"ro.hwui.use_vulkan=true",
+                     b"debug.renderengine.backend=skiavkthreaded", b"debug.renderengine.vulkan=true",
+                     b"ro.hardware.vulkan=virtio"):
+            self.assertIn(line + b"\n", prop)
+        self.assertNotIn(b"skiagl", prop)
+
+
+class PointerTest(unittest.TestCase):
+    def test_the_layer_ships_no_pointer_bridge(self):
+        # The VM uses QEMU's usb-mouse (a real relative mouse for Android). The old tablet bridge showed
+        # up as a hovering stylus and crashed system_server's InputDispatcher when a window changed under it.
+        import build_layer
+        self.assertFalse(hasattr(build_layer, "POINTER_BRIDGE_RC"))
+        self.assertNotIn(b"pointer_bridge", build_layer.ODM_SEPOLICY)
 
 
 class SystemTweaksTest(unittest.TestCase):

@@ -13,7 +13,6 @@ Inputs (env, defaults under GBOS_ROOT):
   GBOS_PORT_IMAGE    gbos-vm-linux security-ported image + manifest.json next to it
                      (software KeyMint, Cuttlefish composer, Venus/VirGL, boot control, ...)
   GBOS_LIBZ          baseline libz.so (vm-amd/zlib-build)
-  GBOS_POINTER_BRIDGE  pointer-bridge/vm-pointer-bridge
   GBOS_FUTILITY_STUB   layer/stubs/out/futility (layer/stubs/build.sh)
   GBOS_GSCUTIL_STUB    layer/stubs/out/gscutil (layer/stubs/build.sh)
   GBOS_VENDOR_MODULES  combined /vendor/lib/modules (kernel/resolve_modules.py --vendor-out)
@@ -40,7 +39,6 @@ LINUX_DIR = Path(os.environ.get('GBOS_LINUX_DIR', ROOT / 'gbos-vm-linux'))
 STOCK_IMAGE = Path(os.environ.get('GBOS_STOCK_IMAGE', LINUX_DIR / 'android-desktop_signed_recovery_image.bin'))
 PORT_IMAGE = Path(os.environ.get('GBOS_PORT_IMAGE', LINUX_DIR / 'image-security/googlebook-security.bin'))
 LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
-POINTER_BRIDGE = Path(os.environ.get('GBOS_POINTER_BRIDGE', HERE.parents[1] / 'pointer-bridge/vm-pointer-bridge'))
 FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futility'))
 GSCUTIL_STUB = Path(os.environ.get('GBOS_GSCUTIL_STUB', HERE / 'stubs/out/gscutil'))
 VENDOR_MODULES = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
@@ -110,39 +108,8 @@ VM_POWER_RC = (
     b'    start vm-stay-awake\n'
 )
 
-POINTER_BRIDGE_RC = (
-    b'# gbos: QEMU usb-tablet -> uinput pointer + wheel (domain gbos_pointer_bridge, odm_sepolicy.cil).\n'
-    b'service vm-pointer-bridge /vendor/bin/vm-pointer-bridge\n'
-    b'    class late_start\n'
-    b'    user root\n'
-    b'    group root input uhid\n'
-)
-
 # Versioned names (_202604) are how vendor-side policy refers to platform types.
 ODM_SEPOLICY = b''';; gbos layer policy, compiled by init together with the stock policy.
-(type gbos_pointer_bridge)
-(roletype object_r gbos_pointer_bridge)
-(type gbos_pointer_bridge_exec)
-(roletype object_r gbos_pointer_bridge_exec)
-(typeattributeset domain (gbos_pointer_bridge))
-(typeattributeset file_type (gbos_pointer_bridge_exec))
-(typeattributeset exec_type (gbos_pointer_bridge_exec))
-(typeattributeset vendor_file_type (gbos_pointer_bridge_exec))
-(allow init_202604 gbos_pointer_bridge_exec (file (read getattr map execute open)))
-(allow init_202604 gbos_pointer_bridge (process (transition siginh rlimitinh)))
-(dontaudit init_202604 gbos_pointer_bridge (process (noatsecure)))
-(typetransition init_202604 gbos_pointer_bridge_exec process gbos_pointer_bridge)
-(allow gbos_pointer_bridge gbos_pointer_bridge_exec (file (read getattr map execute open entrypoint)))
-(allow gbos_pointer_bridge input_device_202604 (dir (ioctl read getattr lock open watch watch_reads search)))
-(allow gbos_pointer_bridge input_device_202604 (chr_file (ioctl read write getattr lock append map open)))
-(allow gbos_pointer_bridge uhid_device_202604 (chr_file (ioctl read write getattr lock append map open)))
-(allow gbos_pointer_bridge sysfs_202604 (dir (read open getattr search)))
-(allow gbos_pointer_bridge sysfs_202604 (file (read open getattr)))
-(allow gbos_pointer_bridge sysfs_202604 (lnk_file (read getattr)))
-;; /sys/class/drm/*/modes for the display size; the virtio-gpu node is sysfs_gpu (odm_file_contexts).
-(allow gbos_pointer_bridge sysfs_gpu_202604 (dir (read open getattr search)))
-(allow gbos_pointer_bridge sysfs_gpu_202604 (file (read open getattr)))
-(allow gbos_pointer_bridge sysfs_gpu_202604 (lnk_file (read getattr)))
 ;; SYSTEM_TWEAKS_RC: the gscutil wrapper (system_ext types) runs the real gscutil kept under /vendor.
 (allow vendor_init_202604 gscutil_exec (file (mounton getattr)))
 (allow init_202604 gscutil_exec (file (mounton getattr)))
@@ -330,8 +297,6 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
             BOOTANIMATION_TEXT)),
         'etc/init/gbos-system-tweaks.rc': (SYSTEM_TWEAKS_RC, 'vendor_configs_file', 0o644, 0, 0),
         'etc/init/vm-power.rc': (VM_POWER_RC, 'vendor_configs_file', 0o644, 0, 0),
-        'etc/init/vm-pointer-bridge.rc': (POINTER_BRIDGE_RC, 'vendor_configs_file', 0o644, 0, 0),
-        'bin/vm-pointer-bridge': (POINTER_BRIDGE.read_bytes(), 'gbos_pointer_bridge_exec', 0o755, 0, 2000),
         # OTA postinstall flashes the AP firmware through futility; there is none (stubs/futility.c).
         'bin/futility': _entry(stock_vendor, 'bin/futility', FUTILITY_STUB.read_bytes()),
         SYSTEM_GSCUTIL: _entry(stock_system, 'system/bin/gscutil', GSCUTIL_STUB.read_bytes()),
@@ -340,8 +305,19 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
     return files
 
 
+# Render apps (HWUI) and SurfaceFlinger with Vulkan through Venus (vulkan.virtio.so -> the host's Vulkan
+# driver) instead of GL over virgl, which the security port picked.
+VULKAN_PROPS = {
+    'debug.hwui.renderer': 'skiavk',
+    'ro.hwui.use_vulkan': 'true',
+    'debug.renderengine.backend': 'skiavkthreaded',
+    'debug.renderengine.vulkan': 'true',
+    'ro.hardware.vulkan': 'virtio',
+}
+
+
 def odm_files(overrides: dict, contexts: list):
-    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'})
+    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'}, **VULKAN_PROPS)
     return {
         'etc/build.prop': (odm_build_prop(prop).encode(), 'vendor_configs_file', 0o644, 0, 0),
         'etc/selinux/odm_file_contexts': (''.join(l + '\n' for l in contexts).encode(), 'vendor_configs_file', 0o644, 0, 0),
@@ -435,7 +411,7 @@ def build_disk(erofs: Path, disk: Path):
 
 def main():
     out = Path(sys.argv[1])
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE, FUTILITY_STUB, GSCUTIL_STUB, VENDOR_MODULES,
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VENDOR_MODULES,
                  FIRMWARE):
         if not need.exists():
             raise SystemExit(f'missing {need}')
