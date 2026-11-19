@@ -13,17 +13,19 @@
 #   GBOS_NET_ARGS      e.g. "-nic none" for offline         
 #   GBOS_LOGLEVEL      kernel console loglevel (7 shows gfni_emu counters)
 #   GBOS_ONCE=1        do not relaunch after a guest reboot
-#   GBOS_VULKAN=1      Vulkan rendering (vm/layer-vulkan.img + vm-amd/virgl)
+#   GBOS_VULKAN=1      Vulkan rendering through Venus (patched virglrenderer, vm-amd/virgl)
 set -eu
 GBOS="${GBOS_ROOT:-/mnt/dados/gbos}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 NAME="${1:-daily}"
 BASE="${GBOS_BASE:-$GBOS/vm/stock/googlebook.bin}"
 LAYER="${GBOS_LAYER:-$GBOS/vm/layer.img}"
-# GBOS_VULKAN=1: the --vulkan layer (Android renders with Vulkan through Venus) on the patched
-# virglrenderer from vm-amd/virgl (build.sh); QEMU alone loads it, the system library is untouched.
+# Graphics stack (the layer's /odm/etc/gbos/gpu_<stack>.prop): GL over virgl, or with GBOS_VULKAN=1
+# Vulkan through Venus on the patched virglrenderer from vm-amd/virgl (build.sh); QEMU alone loads
+# it, the system library is untouched.
+GPU_STACK=virgl
 if [ "${GBOS_VULKAN:-0}" = 1 ]; then
-  LAYER="${GBOS_LAYER:-$GBOS/vm/layer-vulkan.img}"
+  GPU_STACK=venus
   [ -f "$HERE/virgl/out/lib/libvirglrenderer.so.1" ] || { echo "run vm-amd/virgl/build.sh first" >&2; exit 1; }
   export LD_LIBRARY_PATH="$HERE/virgl/out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   export VIRGL_GBM_LAYOUT_FORCE_ENABLE=1
@@ -68,7 +70,7 @@ boot_once() {
   local shared
   shared="$(sed 's/#.*//' "$HERE/boot/cmdline.txt" | tr -s ' \n' ' ')"
   local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 console_msg_format=syslog \
-$shared loglevel=${GBOS_LOGLEVEL:-4} androidboot.gbos.vm=1 androidboot.slot_suffix=$SLOT androidboot.boot_devices=pci0000:00/0000:00:04.0 \
+$shared loglevel=${GBOS_LOGLEVEL:-4} androidboot.gbos.vm=1 androidboot.gbos.gpu=$GPU_STACK androidboot.slot_suffix=$SLOT androidboot.boot_devices=pci0000:00/0000:00:04.0 \
 androidboot.vbmeta.size=$VBMETA_SIZE androidboot.vbmeta.hash_alg=sha256 androidboot.vbmeta.digest=$VBMETA_DIGEST"
   # shellcheck disable=SC2086
   systemd-run --user --scope -q -p MemoryMax="$GBOS_HOST_MEM_MAX" -p MemorySwapMax=0 -p CPUQuota=$(( GBOS_SMP * 100 ))% \

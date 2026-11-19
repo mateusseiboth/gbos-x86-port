@@ -94,5 +94,47 @@ class GbosBootPlanTest(unittest.TestCase):
         self.assertEqual(out.stdout.strip(), "pci0000:00/0000:00:08.1/0000:0a:00.3")
 
 
+def pci(root, slot, vendor, cls):
+    d = root / slot
+    d.mkdir(parents=True)
+    (d / "vendor").write_text(f"0x{vendor:04x}\n")
+    (d / "class").write_text(f"0x{cls:06x}\n")
+
+
+@unittest.skipUnless(CC, "needs cc")
+class GpuDetectionTest(unittest.TestCase):
+    # androidboot.gbos.gpu picks the layer's graphics stack (/odm/etc/gbos/gpu_<stack>.prop).
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.exe = cls.tmp / "gbos-boot"
+        subprocess.run([CC, "-O2", "-o", str(cls.exe), str(HERE / "gbos_boot.c")], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def gpu(self, devices):
+        root = Path(tempfile.mkdtemp(dir=self.tmp))
+        for slot, vendor, cls in devices:
+            pci(root, slot, vendor, cls)
+        return subprocess.run([str(self.exe), "--gpu", str(root)], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def test_amd_apu(self):
+        self.assertEqual(self.gpu([("0000:00:00.0", 0x1022, 0x060000), ("0000:0a:00.0", 0x1002, 0x030000)]), "amd")
+
+    def test_intel_wins_over_a_discrete_nvidia(self):
+        self.assertEqual(self.gpu([("0000:01:00.0", 0x10de, 0x030200), ("0000:00:02.0", 0x8086, 0x030000)]),
+                         "intel")
+
+    def test_qemu_virtio_gpu(self):
+        self.assertEqual(self.gpu([("0000:00:01.0", 0x1af4, 0x038000)]), "virgl")
+
+    def test_anything_else_renders_in_software(self):
+        self.assertEqual(self.gpu([("0000:01:00.0", 0x10de, 0x030000)]), "swiftshader")
+        self.assertEqual(self.gpu([("0000:00:1f.0", 0x8086, 0x060100)]), "swiftshader")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 """Build the gbos overlay layer: everything vm-amd adds to a *stock* lapis image, as one erofs
 (with SELinux labels) that the first-stage fstab mounts over /vendor and /odm.
 
-  build_layer.py OUT_DISK_IMG [--vulkan]     (vm/layer.img: GL over virgl; vm/layer-vulkan.img: --vulkan)
+  build_layer.py OUT_DISK_IMG
 
 The stock system_a / vendor_a stay byte-identical, so an OTA can verify and apply, and the layer
 applies to whichever slot boots. /system itself cannot be overlaid on a user build (fs_mgr
@@ -16,6 +16,7 @@ Inputs (env, defaults under GBOS_ROOT):
   GBOS_FUTILITY_STUB   layer/stubs/out/futility (layer/stubs/build.sh)
   GBOS_GSCUTIL_STUB    layer/stubs/out/gscutil (layer/stubs/build.sh)
   GBOS_VM_MOUSE        pointer/out/vm-mouse (pointer/build.sh)
+  GBOS_SWIFTSHADER     graphics/vulkan.pastel.so (layer/fetch_swiftshader.py)
   GBOS_VENDOR_MODULES  combined /vendor/lib/modules (kernel/resolve_modules.py --vendor-out)
   GBOS_FIRMWARE        firmware tree (kernel/collect_firmware.py), added under /vendor/firmware
 """
@@ -43,6 +44,7 @@ LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
 FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futility'))
 GSCUTIL_STUB = Path(os.environ.get('GBOS_GSCUTIL_STUB', HERE / 'stubs/out/gscutil'))
 VM_MOUSE = Path(os.environ.get('GBOS_VM_MOUSE', HERE.parent / 'pointer/out/vm-mouse'))
+SWIFTSHADER = Path(os.environ.get('GBOS_SWIFTSHADER', ROOT / 'graphics/vulkan.pastel.so'))
 VENDOR_MODULES = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
 FIRMWARE = Path(os.environ.get('GBOS_FIRMWARE', ROOT / 'dlkm/firmware'))
 SUPER_BASE = 1458176 * 512
@@ -339,14 +341,24 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
         # OTA postinstall flashes the AP firmware through futility; there is none (stubs/futility.c).
         'bin/futility': _entry(stock_vendor, 'bin/futility', FUTILITY_STUB.read_bytes()),
         SYSTEM_GSCUTIL: _entry(stock_system, 'system/bin/gscutil', GSCUTIL_STUB.read_bytes()),
+        # Graphics for GPUs without drivers in the image (gpu_amd/swiftshader.prop).
+        'lib64/hw/vulkan.pastel.so': _entry(stock_vendor, 'lib64/hw/vulkan.intel.so', SWIFTSHADER.read_bytes()),
+        'lib64/libminigbm_gralloc.so': _entry(stock_vendor, 'lib64/libminigbm_gralloc.so', patch_minigbm(
+            port.dump_cat(stock_vendor, '/lib64/libminigbm_gralloc.so'))),
         SYSTEM_GSCUTIL_REAL: _entry(stock_system, 'system/bin/gscutil', b''),  # mount point
     }
     return files
 
 
-# --vulkan: apps (HWUI) and SurfaceFlinger render with Vulkan through Venus (vulkan.virtio.so -> the
-# host's Vulkan driver). Needs QEMU on the patched virglrenderer (vm-amd/virgl, GBOS_VULKAN=1): the
-# stock one cannot export guest buffers to Venus and SurfaceFlinger aborts importing them.
+# Graphics stack, chosen at boot: androidboot.gbos.gpu (run_vm.sh; usb/gbos_boot.c from the PCI
+# display controller) selects /odm/etc/gbos/gpu_<stack>.prop, imported by /odm/etc/build.prop.
+GPU_KEYS = {'debug.hwui.renderer', 'debug.renderengine.backend', 'debug.renderengine.vulkan',
+            'debug.renderengine.graphite_desktop_optin', 'ro.gfx.angle.supported', 'ro.hardware.egl',
+            'ro.hardware.vulkan', 'ro.hwui.use_vulkan'}
+GPU_IMPORT = 'import /odm/etc/gbos/gpu_${ro.boot.gbos.gpu:-virgl}.prop'
+
+# venus: apps (HWUI) and SurfaceFlinger render with Vulkan through Venus (vulkan.virtio.so -> the host's
+# Vulkan driver). Needs QEMU on the patched virglrenderer (vm-amd/virgl, GBOS_VULKAN=1).
 VULKAN_PROPS = {
     'debug.hwui.renderer': 'skiavk',
     'ro.hwui.use_vulkan': 'true',
@@ -354,6 +366,34 @@ VULKAN_PROPS = {
     'debug.renderengine.vulkan': 'true',
     'ro.hardware.vulkan': 'virtio',
 }
+
+# amd / swiftshader: ANGLE (in /system) on SwiftShader Vulkan (vulkan.pastel.so, from Cuttlefish), as
+# Cuttlefish's guest_swiftshader mode. The image has no Mesa for AMD GPUs yet.
+SOFTWARE_PROPS = {
+    'ro.hardware.egl': 'angle',
+    'ro.hardware.vulkan': 'pastel',
+    'ro.gfx.angle.supported': 'true',
+    'debug.hwui.renderer': 'skiagl',
+    'ro.hwui.use_vulkan': 'false',
+    'debug.renderengine.backend': 'skiaglthreaded',
+    'debug.renderengine.vulkan': 'false',
+}
+
+
+def gpu_props(overrides: dict) -> dict:
+    """{stack: props}. virgl is the security port's GL-over-virgl stack; intel keeps the stock drivers."""
+    virgl = {k: v for k, v in overrides.items() if k in GPU_KEYS}
+    return {'virgl': virgl, 'venus': dict(virgl, **VULKAN_PROPS), 'intel': {},
+            'amd': SOFTWARE_PROPS, 'swiftshader': SOFTWARE_PROPS}
+
+
+def patch_minigbm(lib: bytes) -> bytes:
+    """Google's minigbm has no amdgpu backend; its "radeon" entry is the generic dumb-buffer backend,
+    which amdgpu supports, and the names have the same length."""
+    old, new = b'\x00radeon\x00', b'\x00amdgpu\x00'
+    if lib.count(old) != 1:
+        raise ValueError(f'expected one "radeon" driver name in minigbm, found {lib.count(old)}')
+    return lib.replace(old, new)
 
 
 # PCI identity files and drm/ nodes of any PCI device, at any bridge depth, as sysfs_gpu: libdrm and
@@ -366,10 +406,14 @@ GPU_SYSFS_CONTEXTS = [
 ]
 
 
-def odm_files(overrides: dict, contexts: list, vulkan: bool = False):
-    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'}, **(VULKAN_PROPS if vulkan else {}))
+def odm_files(overrides: dict, contexts: list):
+    base = {k: v for k, v in overrides.items() if k not in GPU_KEYS}
+    base['ro.dalvik.vm.native.bridge'] = '0'
+    stacks = {f'etc/gbos/gpu_{stack}.prop': (odm_build_prop(props).encode(), 'vendor_configs_file', 0o644, 0, 0)
+              for stack, props in gpu_props(overrides).items()}
     return {
-        'etc/build.prop': (odm_build_prop(prop).encode(), 'vendor_configs_file', 0o644, 0, 0),
+        'etc/build.prop': ((odm_build_prop(base) + GPU_IMPORT + '\n').encode(), 'vendor_configs_file', 0o644, 0, 0),
+        **stacks,
         'etc/selinux/odm_file_contexts': (''.join(l + '\n' for l in contexts + GPU_SYSFS_CONTEXTS).encode(),
                                           'vendor_configs_file', 0o644, 0, 0),
         'etc/selinux/odm_sepolicy.cil': (ODM_SEPOLICY, 'vendor_configs_file', 0o644, 0, 0),
@@ -385,7 +429,8 @@ def layer_dirs(vendor_files, stock_vendor: Path, stock_system: Path):
             'vendor': (root['mode'] & 0o7777, root['uid'], root['gid'], port._label(root)),
             'odm': (odm['mode'] & 0o7777, odm['uid'], odm['gid'], port._label(odm)),
             'odm/etc': (0o755, 0, 2000, 'vendor_configs_file'),
-            'odm/etc/selinux': (0o755, 0, 0, 'vendor_configs_file')}
+            'odm/etc/selinux': (0o755, 0, 0, 'vendor_configs_file'),
+            'odm/etc/gbos': (0o755, 0, 0, 'vendor_configs_file')}
     # lib/modules is a symlink in the stock vendor: the layer's directory takes its place.
     new_dirs = {d: new_dir_meta(d) for d in sorted(ancestor_dirs(vendor_files)) if not _is_stock_dir(stock_vendor, d)}
     for rel, meta in port.dir_entries(stock_vendor, vendor_files, new_dirs).items():
@@ -462,8 +507,7 @@ def build_disk(erofs: Path, disk: Path):
 
 def main():
     out = Path(sys.argv[1])
-    vulkan = '--vulkan' in sys.argv[2:]
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VM_MOUSE, VENDOR_MODULES,
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VM_MOUSE, SWIFTSHADER, VENDOR_MODULES,
                  FIRMWARE):
         if not need.exists():
             raise SystemExit(f'missing {need}')
@@ -475,7 +519,7 @@ def main():
         pfiles, overrides, contexts = port_files(port_vendor, stock_vendor)
         vendor = {**pfiles, **gbos_vendor_files(stock_vendor, stock_system), **driver_files(stock_vendor)}
         files = {layer_path('vendor', k): v for k, v in vendor.items()}
-        files.update({layer_path('odm', k): v for k, v in odm_files(overrides, contexts, vulkan).items()})
+        files.update({layer_path('odm', k): v for k, v in odm_files(overrides, contexts).items()})
         build_erofs(layer_dirs(vendor, stock_vendor, stock_system), files, tmp / 'layer.erofs', tmp)
         build_disk(tmp / 'layer.erofs', out)
         print(f'layer: {len(files)} files, {len(overrides)} prop overrides, {len(contexts)} file contexts -> {out}')

@@ -11,6 +11,7 @@
  *   gbos-boot                       as /init of the stage-1 initramfs
  *   gbos-boot --plan DISK [--write] print SLOT/VBMETA_SIZE/VBMETA_DIGEST for a disk image (tests)
  *   gbos-boot --boot-device SYSPATH print the androidboot.boot_devices value for a block device
+ *   gbos-boot --gpu PCI_DEVICES_DIR print the graphics stack for androidboot.gbos.gpu
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -256,6 +257,54 @@ static int boot_device(const char *syspath, char *out, size_t outlen)
 	return 0;
 }
 
+/* ---- graphics stack ------------------------------------------------------------------- */
+
+/* PCI vendor of a display controller (class 0x03xxxx) -> the layer's gpu_<stack>.prop, by priority:
+ * Intel has native drivers in the image; AMD and anything else render in software for now. */
+static const struct { unsigned vendor; const char *stack; int rank; } GPU_STACKS[] = {
+	{ 0x8086, "intel", 4 },
+	{ 0x1002, "amd", 3 },
+	{ 0x1af4, "virgl", 2 },
+};
+#define FALLBACK_STACK "swiftshader"
+
+static unsigned read_hex(const char *dir, const char *name)
+{
+	char path[PATH_MAX], buf[32] = "";
+	snprintf(path, sizeof path, "%s/%s", dir, name);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return 0;
+	if (!fgets(buf, sizeof buf, f))
+		buf[0] = 0;
+	fclose(f);
+	return (unsigned)strtoul(buf, NULL, 16);
+}
+
+static const char *gpu_stack(const char *pci_root)
+{
+	DIR *dir = opendir(pci_root);
+	if (!dir)
+		return FALLBACK_STACK;
+	const char *best = FALLBACK_STACK;
+	int best_rank = 0;
+	struct dirent *e;
+	while ((e = readdir(dir))) {
+		if (e->d_name[0] == '.')
+			continue;
+		char dev[PATH_MAX];
+		snprintf(dev, sizeof dev, "%s/%s", pci_root, e->d_name);
+		if ((read_hex(dev, "class") >> 16) != 0x03)
+			continue;
+		unsigned vendor = read_hex(dev, "vendor");
+		for (unsigned i = 0; i < sizeof GPU_STACKS / sizeof GPU_STACKS[0]; i++)
+			if (GPU_STACKS[i].vendor == vendor && GPU_STACKS[i].rank > best_rank)
+				best = GPU_STACKS[i].stack, best_rank = GPU_STACKS[i].rank;
+	}
+	closedir(dir);
+	return best;
+}
+
 /* ---- stage-1 init ----------------------------------------------------------------------- */
 
 static void say(const char *fmt, const char *arg)
@@ -358,11 +407,14 @@ static int stage1(void)
 	const char *base = read_file("/gbos/cmdline");
 	if (!base)
 		halt_with("missing /gbos/cmdline");
-	static char cmdline[8192];
+	static char cmdline[8192], gpu[64] = "";
+	/* ro.boot.* keep their first value: a stack forced in /gbos/cmdline (tests) wins. */
+	if (!strstr(base, "androidboot.gbos.gpu="))
+		snprintf(gpu, sizeof gpu, " androidboot.gbos.gpu=%s", gpu_stack("/sys/bus/pci/devices"));
 	snprintf(cmdline, sizeof cmdline,
-		 "%s androidboot.slot_suffix=%s androidboot.boot_devices=%s androidboot.vbmeta.size=%u "
+		 "%s%s androidboot.slot_suffix=%s androidboot.boot_devices=%s androidboot.vbmeta.size=%u "
 		 "androidboot.vbmeta.hash_alg=sha256 androidboot.vbmeta.digest=%s",
-		 base, p.slot, bootdev, p.vbmeta_size, p.digest);
+		 base, gpu, p.slot, bootdev, p.vbmeta_size, p.digest);
 	say("booting slot %s", p.slot);
 
 	int kernel = open("/gbos/kernel", O_RDONLY | O_CLOEXEC);
@@ -386,6 +438,10 @@ int main(int argc, char **argv)
 		if (d.fd < 0 || read_gpt(&d) || make_plan(&d, write_back, &p))
 			return 1;
 		printf("SLOT=%s\nVBMETA_SIZE=%u\nVBMETA_DIGEST=%s\n", p.slot, p.vbmeta_size, p.digest);
+		return 0;
+	}
+	if (argc == 3 && !strcmp(argv[1], "--gpu")) {
+		puts(gpu_stack(argv[2]));
 		return 0;
 	}
 	if (argc == 3 && !strcmp(argv[1], "--boot-device")) {

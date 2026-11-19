@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_layer import (ODM_SEPOLICY, VM_MOUSE_RC, odm_files, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
+from build_layer import (ODM_SEPOLICY, VM_MOUSE_RC, odm_files, patch_minigbm, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
                          new_dir_meta, odm_build_prop, parse_erofs_ls, prop_overrides, tree_entries, write_tar)
 
 
@@ -89,21 +89,59 @@ class VmPowerTest(unittest.TestCase):
 
 
 class GraphicsTest(unittest.TestCase):
-    def test_rendering_stays_on_gl_over_virgl(self):
-        # Vulkan through the port's Venus driver crashed SurfaceFlinger in
-        # vkGetAndroidHardwareBufferPropertiesANDROID (gralloc buffers) and the guest boot-looped.
-        prop = odm_files({"debug.hwui.renderer": "skiagl", "ro.hwui.use_vulkan": "false"}, [])["etc/build.prop"][0]
-        self.assertIn(b"debug.hwui.renderer=skiagl\n", prop)
-        self.assertNotIn(b"skiavk", prop)
+    # The graphics stack is chosen at boot: androidboot.gbos.gpu (run_vm.sh, usb/gbos_boot.c) selects
+    # /odm/etc/gbos/gpu_<stack>.prop, imported by /odm/etc/build.prop. One layer for VM and PCs.
+    PORT = {"debug.hwui.renderer": "skiagl", "ro.hardware.egl": "virgl", "ro.hardware.vulkan": "virtio",
+            "ro.gfx.angle.supported": "false", "ro.surface_flinger.has_HDR_display": "false"}
 
-    def test_the_vulkan_layer_renders_with_vulkan_through_venus(self):
+    def files(self):
+        return odm_files(self.PORT, [])
+
+    def prop(self, stack):
+        return self.files()[f"etc/gbos/gpu_{stack}.prop"][0].decode()
+
+    def test_build_prop_imports_the_stack_of_the_detected_gpu(self):
+        base = self.files()["etc/build.prop"][0].decode()
+        self.assertTrue(base.rstrip().endswith("import /odm/etc/gbos/gpu_${ro.boot.gbos.gpu:-virgl}.prop"))
+        self.assertIn("ro.surface_flinger.has_HDR_display=false\n", base)
+        self.assertNotIn("ro.hardware.egl", base)
+
+    def test_virgl_keeps_the_security_ports_gl_stack(self):
+        self.assertIn("ro.hardware.egl=virgl\n", self.prop("virgl"))
+        self.assertIn("debug.hwui.renderer=skiagl\n", self.prop("virgl"))
+
+    def test_venus_is_virgl_with_vulkan_rendering(self):
         # Needs the patched virglrenderer (vm-amd/virgl): GBOS_VULKAN=1 run_vm.sh.
-        prop = odm_files({"debug.hwui.renderer": "skiagl"}, [], vulkan=True)["etc/build.prop"][0]
-        for line in (b"debug.hwui.renderer=skiavk", b"ro.hwui.use_vulkan=true",
-                     b"debug.renderengine.backend=skiavkthreaded", b"debug.renderengine.vulkan=true",
-                     b"ro.hardware.vulkan=virtio"):
-            self.assertIn(line + b"\n", prop)
-        self.assertNotIn(b"skiagl", prop)
+        prop = self.prop("venus")
+        for line in ("ro.hardware.egl=virgl", "debug.hwui.renderer=skiavk", "ro.hwui.use_vulkan=true",
+                     "debug.renderengine.backend=skiavkthreaded", "ro.hardware.vulkan=virtio"):
+            self.assertIn(line + "\n", prop)
+        self.assertNotIn("skiagl", prop)
+
+    def test_amd_and_unknown_gpus_render_in_software(self):
+        # ANGLE (in /system) on SwiftShader Vulkan (vulkan.pastel.so, from Cuttlefish).
+        for stack in ("amd", "swiftshader"):
+            prop = self.prop(stack)
+            for line in ("ro.hardware.egl=angle", "ro.hardware.vulkan=pastel", "ro.gfx.angle.supported=true",
+                         "debug.hwui.renderer=skiagl", "debug.renderengine.backend=skiaglthreaded"):
+                self.assertIn(line + "\n", prop)
+
+    def test_intel_keeps_the_stock_drivers(self):
+        self.assertNotIn("ro.hardware.egl", self.prop("intel"))
+
+
+class MinigbmTest(unittest.TestCase):
+    def test_amdgpu_takes_the_dumb_radeon_backend(self):
+        # Google's minigbm has no amdgpu backend; its "radeon" one is the generic dumb-buffer backend,
+        # which amdgpu supports. Same length, so the driver table just gets the other name.
+        lib = b"\x00i915\x00radeon\x00udl\x00"
+        self.assertEqual(patch_minigbm(lib), b"\x00i915\x00amdgpu\x00udl\x00")
+
+    def test_refuses_an_unexpected_library(self):
+        with self.assertRaises(ValueError):
+            patch_minigbm(b"\x00radeon\x00\x00radeon\x00")
+        with self.assertRaises(ValueError):
+            patch_minigbm(b"\x00i915\x00")
 
 
 class GpuSysfsLabelTest(unittest.TestCase):
