@@ -51,29 +51,25 @@ AVAIL_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 # (relative mode) or, with show-cursor=on, feeds its own warps back as motion and the cursor drifts;
 # GTK shows it and remembers where it warped to.
 : "${GBOS_DISPLAY_ARGS:=-display gtk,gl=on,show-cursor=on}"
-# usb-mouse: a real relative mouse for Android (click the window to capture it, Ctrl+Alt+G releases).
-: "${GBOS_INPUT_ARGS:=-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0}"
+# usb-tablet: absolute, no grab (a captured relative mouse cannot work under Wayland, which forbids
+# warping the pointer); the layer's vm-mouse turns it into a plain mouse for Android.
+: "${GBOS_INPUT_ARGS:=-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0}"
 : "${GBOS_NET_ARGS:=-netdev user,id=net0,ipv6=off -device virtio-net-pci,netdev=net0}"
 
 boot_once() {
   eval "$(python3 "$HERE/boot/slot.py" boot-args "$OVERLAY" "$BASE")"
   mkdir -p "$LOG"
   [ -f "$LOG/serial.log" ] && mv -f "$LOG/serial.log" "$LOG/serial.log.prev"
-  echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes); the window stays black for ~20 s, then the boot animation; click it to capture the mouse, Ctrl+Alt+G releases it" >&2
+  echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes); the window stays black for ~20 s, then the boot animation" >&2
   # i8042=off: with Fedora's psmouse loaded, the guest enables the PS/2 mouse and QEMU then sends the
   # pointer there instead of to the USB mouse.
-  # cfi=norand: gfni_emu's entry stubs carry fixed kCFI hashes. overlay.gbos_caller_creds: the layer is
-  # mounted before any SELinux policy exists (see the kernel patch).
-  local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 panic=0 root=/dev/ram0 \
-loglevel=${GBOS_LOGLEVEL:-4} 8250.nr_uarts=4 console_msg_format=syslog log_buf_len=1M cgroup_disable=pressure \
-firmware_class.path=/vendor/firmware binder.impl=rust ia32_emulation=false vsyscall=none printk.devkmsg=on \
-cfi=norand overlay.gbos_caller_creds=1 \
-androidboot.hardware=android-desktop androidboot.hardware.platform=android-desktop androidboot.slot_suffix=$SLOT \
-androidboot.boot_devices=pci0000:00/0000:00:04.0 androidboot.vbmeta.size=$VBMETA_SIZE androidboot.vbmeta.hash_alg=sha256 \
-androidboot.vbmeta.digest=$VBMETA_DIGEST androidboot.vbmeta.device_state=unlocked androidboot.verifiedbootstate=orange \
-androidboot.veritymode=enforcing androidboot.vendor.apex.com.android.hardware.keymint.strongbox.desktop=none \
-androidboot.vendor.boot_patchlevel=2026-09-01 androidboot.boot_patchlevel=2026-09-01 \
-androidboot.dalvik.vm.enable_uffd_gc=true androidboot.zygote.disable_gl_preload"
+  # Shared arguments live in boot/cmdline.txt (also used by the pendrive); the VM adds the serial
+  # console, its loglevel, slot, vbmeta and the NVMe controller as boot device.
+  local shared
+  shared="$(sed 's/#.*//' "$HERE/boot/cmdline.txt" | tr -s ' \n' ' ')"
+  local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 console_msg_format=syslog \
+$shared loglevel=${GBOS_LOGLEVEL:-4} androidboot.gbos.vm=1 androidboot.slot_suffix=$SLOT androidboot.boot_devices=pci0000:00/0000:00:04.0 \
+androidboot.vbmeta.size=$VBMETA_SIZE androidboot.vbmeta.hash_alg=sha256 androidboot.vbmeta.digest=$VBMETA_DIGEST"
   # shellcheck disable=SC2086
   systemd-run --user --scope -q -p MemoryMax="$GBOS_HOST_MEM_MAX" -p MemorySwapMax=0 -p CPUQuota=$(( GBOS_SMP * 100 ))% \
     timeout "${GBOS_SECS:-28800}" qemu-system-x86_64 -enable-kvm -cpu host -smp "$GBOS_SMP" -m "$GBOS_MEM" -machine q35,i8042=off \

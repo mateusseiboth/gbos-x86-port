@@ -15,6 +15,7 @@ Inputs (env, defaults under GBOS_ROOT):
   GBOS_LIBZ          baseline libz.so (vm-amd/zlib-build)
   GBOS_FUTILITY_STUB   layer/stubs/out/futility (layer/stubs/build.sh)
   GBOS_GSCUTIL_STUB    layer/stubs/out/gscutil (layer/stubs/build.sh)
+  GBOS_VM_MOUSE        pointer/out/vm-mouse (pointer/build.sh)
   GBOS_VENDOR_MODULES  combined /vendor/lib/modules (kernel/resolve_modules.py --vendor-out)
   GBOS_FIRMWARE        firmware tree (kernel/collect_firmware.py), added under /vendor/firmware
 """
@@ -41,6 +42,7 @@ PORT_IMAGE = Path(os.environ.get('GBOS_PORT_IMAGE', LINUX_DIR / 'image-security/
 LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
 FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futility'))
 GSCUTIL_STUB = Path(os.environ.get('GBOS_GSCUTIL_STUB', HERE / 'stubs/out/gscutil'))
+VM_MOUSE = Path(os.environ.get('GBOS_VM_MOUSE', HERE.parent / 'pointer/out/vm-mouse'))
 VENDOR_MODULES = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
 FIRMWARE = Path(os.environ.get('GBOS_FIRMWARE', ROOT / 'dlkm/firmware'))
 SUPER_BASE = 1458176 * 512
@@ -91,25 +93,60 @@ on property:sys.boot_completed=1
 TEST_POWER_OPTIONS = 'options test_power ac_online=on battery_status=full battery_capacity=100\n'
 
 VM_POWER_RC = (
-    b'on early-boot\n'
+    b'on early-boot && property:ro.boot.gbos.vm=1\n'
     b'    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -d /vendor/lib/modules test_power\n\n'
-    b'on boot\n'
+    b'on boot && property:ro.boot.gbos.vm=1\n'
     b'    write /sys/power/wake_lock gbos_vm\n\n'
     b'service vm-stay-awake /system/bin/sh -c "for i in $$(seq 1 60); do '
     b'cmd settings put global stay_on_while_plugged_in 7 && break; sleep 5; done; '
-    b'cmd settings put system screen_off_timeout 2147483647"\n'
+    b'cmd settings put system screen_off_timeout 2147483647; '
+    b'cmd settings put system mouse_pointer_acceleration_enabled 0"\n'
     b'    class late_start\n'
     b'    user shell\n'
     b'    group shell\n'
     b'    seclabel u:r:shell:s0\n'
     b'    oneshot\n'
     b'    disabled\n\n'
-    b'on property:sys.boot_completed=1\n'
+    b'on property:sys.boot_completed=1 && property:ro.boot.gbos.vm=1\n'
     b'    start vm-stay-awake\n'
+)
+
+# gbos: QEMU usb-tablet -> relative "VM Mouse" (pointer/vm_mouse.c), VM only.
+VM_MOUSE_RC = (
+    b'service vm-mouse /vendor/bin/vm-mouse\n'
+    b'    class late_start\n'
+    b'    user root\n'
+    b'    group root input uhid\n'
+    b'    disabled\n\n'
+    b'on boot && property:ro.boot.gbos.vm=1\n'
+    b'    start vm-mouse\n'
 )
 
 # Versioned names (_202604) are how vendor-side policy refers to platform types.
 ODM_SEPOLICY = b''';; gbos layer policy, compiled by init together with the stock policy.
+;; VM_MOUSE_RC: reads the tablet, writes uinput, reads the display mode under /sys/class/drm.
+(type gbos_vm_mouse)
+(roletype object_r gbos_vm_mouse)
+(type gbos_vm_mouse_exec)
+(roletype object_r gbos_vm_mouse_exec)
+(typeattributeset domain (gbos_vm_mouse))
+(typeattributeset file_type (gbos_vm_mouse_exec))
+(typeattributeset exec_type (gbos_vm_mouse_exec))
+(typeattributeset vendor_file_type (gbos_vm_mouse_exec))
+(allow init_202604 gbos_vm_mouse_exec (file (read getattr map execute open)))
+(allow init_202604 gbos_vm_mouse (process (transition siginh rlimitinh)))
+(dontaudit init_202604 gbos_vm_mouse (process (noatsecure)))
+(typetransition init_202604 gbos_vm_mouse_exec process gbos_vm_mouse)
+(allow gbos_vm_mouse gbos_vm_mouse_exec (file (read getattr map execute open entrypoint)))
+(allow gbos_vm_mouse input_device_202604 (dir (ioctl read getattr lock open watch watch_reads search)))
+(allow gbos_vm_mouse input_device_202604 (chr_file (ioctl read write getattr lock append map open)))
+(allow gbos_vm_mouse uhid_device_202604 (chr_file (ioctl read write getattr lock append map open)))
+(allow gbos_vm_mouse sysfs_202604 (dir (read open getattr search)))
+(allow gbos_vm_mouse sysfs_202604 (file (read open getattr)))
+(allow gbos_vm_mouse sysfs_202604 (lnk_file (read getattr)))
+(allow gbos_vm_mouse sysfs_gpu_202604 (dir (read open getattr search)))
+(allow gbos_vm_mouse sysfs_gpu_202604 (file (read open getattr)))
+(allow gbos_vm_mouse sysfs_gpu_202604 (lnk_file (read getattr)))
 ;; SYSTEM_TWEAKS_RC: the gscutil wrapper (system_ext types) runs the real gscutil kept under /vendor.
 (allow vendor_init_202604 gscutil_exec (file (mounton getattr)))
 (allow init_202604 gscutil_exec (file (mounton getattr)))
@@ -297,6 +334,8 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
             BOOTANIMATION_TEXT)),
         'etc/init/gbos-system-tweaks.rc': (SYSTEM_TWEAKS_RC, 'vendor_configs_file', 0o644, 0, 0),
         'etc/init/vm-power.rc': (VM_POWER_RC, 'vendor_configs_file', 0o644, 0, 0),
+        'etc/init/vm-mouse.rc': (VM_MOUSE_RC, 'vendor_configs_file', 0o644, 0, 0),
+        'bin/vm-mouse': (VM_MOUSE.read_bytes(), 'gbos_vm_mouse_exec', 0o755, 0, 2000),
         # OTA postinstall flashes the AP firmware through futility; there is none (stubs/futility.c).
         'bin/futility': _entry(stock_vendor, 'bin/futility', FUTILITY_STUB.read_bytes()),
         SYSTEM_GSCUTIL: _entry(stock_system, 'system/bin/gscutil', GSCUTIL_STUB.read_bytes()),
@@ -317,11 +356,22 @@ VULKAN_PROPS = {
 }
 
 
+# PCI identity files and drm/ nodes of any PCI device, at any bridge depth, as sysfs_gpu: libdrm and
+# Mesa read them to find the GPU. The security port labels only 0000:00:01.0 (the VM's GPU slot).
+PCI_DEVICE = r'/sys/devices/pci[0-9a-f:]+(/[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])+'
+GPU_SYSFS_CONTEXTS = [
+    PCI_DEVICE + r'/drm(/.*)? u:object_r:sysfs_gpu:s0',
+    PCI_DEVICE + r'/(uevent|vendor|device|subsystem_vendor|subsystem_device|revision|class|boot_vga|config)'
+    r' u:object_r:sysfs_gpu:s0',
+]
+
+
 def odm_files(overrides: dict, contexts: list, vulkan: bool = False):
     prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'}, **(VULKAN_PROPS if vulkan else {}))
     return {
         'etc/build.prop': (odm_build_prop(prop).encode(), 'vendor_configs_file', 0o644, 0, 0),
-        'etc/selinux/odm_file_contexts': (''.join(l + '\n' for l in contexts).encode(), 'vendor_configs_file', 0o644, 0, 0),
+        'etc/selinux/odm_file_contexts': (''.join(l + '\n' for l in contexts + GPU_SYSFS_CONTEXTS).encode(),
+                                          'vendor_configs_file', 0o644, 0, 0),
         'etc/selinux/odm_sepolicy.cil': (ODM_SEPOLICY, 'vendor_configs_file', 0o644, 0, 0),
         'etc/selinux/precompiled_sepolicy': (PRECOMPILED_PLACEHOLDER, 'vendor_configs_file', 0o644, 0, 0),
     }
@@ -413,7 +463,7 @@ def build_disk(erofs: Path, disk: Path):
 def main():
     out = Path(sys.argv[1])
     vulkan = '--vulkan' in sys.argv[2:]
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VENDOR_MODULES,
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VM_MOUSE, VENDOR_MODULES,
                  FIRMWARE):
         if not need.exists():
             raise SystemExit(f'missing {need}')

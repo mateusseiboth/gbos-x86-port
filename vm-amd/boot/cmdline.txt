@@ -1,0 +1,15 @@
+# Kernel command line shared by the VM (run_vm.sh adds the serial console, slot and vbmeta) and the
+# pendrive (usb/gbos_boot.c adds slot, vbmeta and boot device; build_usb.py the screen console).
+panic=0 root=/dev/ram0 loglevel=4 log_buf_len=1M cgroup_disable=pressure
+# GKI registers no 8250 port without this (console=ttyS0 would print nothing).
+8250.nr_uarts=4
+firmware_class.path=/vendor/firmware binder.impl=rust ia32_emulation=false vsyscall=none printk.devkmsg=on
+# gfni_emu's entry stubs carry fixed kCFI hashes.
+cfi=norand
+# The layer is mounted before any SELinux policy exists (see the kernel patch).
+overlay.gbos_caller_creds=1
+androidboot.hardware=android-desktop androidboot.hardware.platform=android-desktop
+androidboot.vbmeta.device_state=unlocked androidboot.verifiedbootstate=orange androidboot.veritymode=enforcing
+androidboot.vendor.apex.com.android.hardware.keymint.strongbox.desktop=none
+androidboot.vendor.boot_patchlevel=2026-09-01 androidboot.boot_patchlevel=2026-09-01
+androidboot.dalvik.vm.enable_uffd_gc=true androidboot.zygote.disable_gl_preload

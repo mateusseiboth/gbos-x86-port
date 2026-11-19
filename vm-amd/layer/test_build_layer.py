@@ -1,10 +1,11 @@
 import io
+import re
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
-from build_layer import (ODM_SEPOLICY, odm_files, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
+from build_layer import (ODM_SEPOLICY, VM_MOUSE_RC, odm_files, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
                          new_dir_meta, odm_build_prop, parse_erofs_ls, prop_overrides, tree_entries, write_tar)
 
 
@@ -105,13 +106,51 @@ class GraphicsTest(unittest.TestCase):
         self.assertNotIn(b"skiagl", prop)
 
 
-class PointerTest(unittest.TestCase):
-    def test_the_layer_ships_no_pointer_bridge(self):
-        # The VM uses QEMU's usb-mouse (a real relative mouse for Android). The old tablet bridge showed
-        # up as a hovering stylus and crashed system_server's InputDispatcher when a window changed under it.
-        import build_layer
-        self.assertFalse(hasattr(build_layer, "POINTER_BRIDGE_RC"))
-        self.assertNotIn(b"pointer_bridge", build_layer.ODM_SEPOLICY)
+class GpuSysfsLabelTest(unittest.TestCase):
+    # libdrm/Mesa read the GPU's PCI identity and drm/ nodes; the port labeled only 0000:00:01.0
+    # (the VM's slot), so a GPU anywhere else (a real PC, behind a bridge) was "no DRM device".
+    def patterns(self):
+        text = odm_files({}, [])["etc/selinux/odm_file_contexts"][0].decode()
+        return [line.split()[0] for line in text.splitlines() if line.endswith("u:object_r:sysfs_gpu:s0")]
+
+    def labeled(self, path):
+        return any(re.fullmatch(p, path) for p in self.patterns())
+
+    def test_gpu_behind_a_bridge(self):
+        self.assertTrue(self.labeled("/sys/devices/pci0000:00/0000:00:08.1/0000:0a:00.0/uevent"))
+        self.assertTrue(self.labeled("/sys/devices/pci0000:00/0000:00:08.1/0000:0a:00.0/drm/card0/dev"))
+
+    def test_gpu_on_the_root_bus(self):
+        self.assertTrue(self.labeled("/sys/devices/pci0000:00/0000:00:03.0/device"))
+        self.assertTrue(self.labeled("/sys/devices/pci0000:00/0000:00:03.0/drm"))
+
+    def test_other_device_attributes_keep_their_labels(self):
+        self.assertFalse(self.labeled("/sys/devices/pci0000:00/0000:00:03.0/power/control"))
+        self.assertFalse(self.labeled("/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/uevent"))
+
+
+class VmOnlyTest(unittest.TestCase):
+    # run_vm.sh passes androidboot.gbos.vm=1; on a real PC (the pendrive) none of this may run: a fake
+    # battery, no suspend and a tablet bridge only make sense in QEMU.
+    def test_power_tweaks_run_only_in_the_vm(self):
+        for trigger in (b"on early-boot && property:ro.boot.gbos.vm=1\n", b"on boot && property:ro.boot.gbos.vm=1\n",
+                        b"on property:sys.boot_completed=1 && property:ro.boot.gbos.vm=1\n"):
+            self.assertIn(trigger, VM_POWER_RC)
+        self.assertNotIn(b"\non early-boot\n", VM_POWER_RC)
+        self.assertNotIn(b"\non boot\n", VM_POWER_RC)
+
+    def test_vm_mouse_starts_only_in_the_vm(self):
+        self.assertIn(b"service vm-mouse /vendor/bin/vm-mouse\n", VM_MOUSE_RC)
+        self.assertIn(b"    disabled\n", VM_MOUSE_RC)
+        self.assertIn(b"on boot && property:ro.boot.gbos.vm=1\n    start vm-mouse\n", VM_MOUSE_RC)
+
+    def test_pointer_acceleration_is_off_so_the_cursor_follows_the_host_pointer(self):
+        self.assertIn(b"cmd settings put system mouse_pointer_acceleration_enabled 0", VM_POWER_RC)
+
+    def test_vm_mouse_has_its_own_domain(self):
+        self.assertIn(b"(type gbos_vm_mouse)", ODM_SEPOLICY)
+        self.assertIn(b"(typetransition init_202604 gbos_vm_mouse_exec process gbos_vm_mouse)", ODM_SEPOLICY)
+        self.assertNotIn(b"pointer_bridge", ODM_SEPOLICY)
 
 
 class SystemTweaksTest(unittest.TestCase):

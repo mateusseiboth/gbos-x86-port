@@ -49,6 +49,8 @@ SELinux failures.
 | `boot/slot.py` | A/B selection from `misc` + vbmeta size/digest of the chosen slot |
 | `boot/initrd.py` | adds the layer to the ramdisk's first-stage fstab |
 | `boot/progress.py` | prints the boot phases from the serial log while QEMU runs |
+| `boot/cmdline.txt` | kernel arguments shared by the VM and the pendrive |
+| `pointer/vm_mouse.c` | usb-tablet -> relative "VM Mouse" for Android (`pointer/build.sh`) |
 | `layer/bootanimation.py` | the stock boot animation plus a held frame that loops until boot completes |
 | `run_vm.sh` | launcher |
 
@@ -74,12 +76,16 @@ animation until Android is ready.
 counters), `GBOS_ONCE=1` (no relaunch after a guest reboot). Serial log:
 `$GBOS_ROOT/vm/logs/<name>/serial.log`.
 
-The mouse is QEMU's `usb-mouse`, a real relative mouse for Android (cursor, hover, right click, wheel,
-acceleration): click the window to capture it, Ctrl+Alt+G releases it. The window is QEMU's GTK UI
-with `show-cursor=on`: the cursor is Android's (virtio-gpu cursor plane). SDL hides it on grab, or with
-`show-cursor=on` feeds its own pointer warps back to the guest and the cursor drifts. The tablet + `pointer-bridge`
+The mouse is QEMU's `usb-tablet` (absolute, no grab: a captured relative mouse cannot work under
+Wayland, which forbids warping the pointer, so the visible cursor and Android's drifted apart).
+`pointer/vm_mouse.c` (in the layer as `/vendor/bin/vm-mouse`) re-emits it as a plain relative mouse:
+the cursor is parked in the corner first, moved by pixel deltas with Android's pointer acceleration off,
+and every move to a display edge overshoots so both realign. The upstream tablet + `pointer-bridge`
 path showed up as a hovering stylus, and system_server's InputDispatcher aborted (`Expected
 ACTION_HOVER_MOVE instead of MotionEvent`) when a window changed under it.
+
+VM-only behavior (fake battery, no suspend, screen always on, vm-mouse) runs on
+`androidboot.gbos.vm=1`, which `run_vm.sh` passes and the pendrive does not.
 
 ## Build from scratch
 
