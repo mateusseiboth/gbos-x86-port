@@ -73,7 +73,8 @@ counters), `GBOS_ONCE=1` (no relaunch after a guest reboot). Serial log:
 `$GBOS_ROOT/vm/logs/<name>/serial.log`.
 
 The mouse is QEMU's `usb-mouse`, a real relative mouse for Android (cursor, hover, right click, wheel,
-acceleration): click the window to capture it, Ctrl+Alt+G releases it. The tablet + `pointer-bridge`
+acceleration): click the window to capture it, Ctrl+Alt+G releases it. `show-cursor=on` keeps the
+cursor visible while captured (it is Android's, drawn on the virtio-gpu cursor plane). The tablet + `pointer-bridge`
 path showed up as a hovering stylus, and system_server's InputDispatcher aborted (`Expected
 ACTION_HOVER_MOVE instead of MotionEvent`) when a window changed under it.
 
