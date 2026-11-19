@@ -1,35 +1,30 @@
 // SPDX-License-Identifier: MIT
 /*
- * vm-mouse: QEMU's usb-tablet (absolute, needs no grab, works under Wayland) re-emitted as a plain
- * relative mouse ("VM Mouse") through uinput, so Android sees an ordinary mouse: cursor, hover,
- * right click, wheel. Android ignores the tablet itself (no BTN_TOUCH, no REL axes); presenting it
- * as a hovering stylus (the old pointer-bridge) made InputDispatcher abort when a window changed
- * under the pen.
+ * vm-mouse: QEMU's usb-tablet (absolute, needs no grab, works under Wayland) re-emitted through
+ * uinput as two devices Android handles natively:
  *
- * Absolute -> relative: Android's cursor is moved by the pixel delta to each new position (pointer
- * acceleration is off, see vm-power.rc). The cursor is parked in the corner first, and every move
- * that reaches a display edge overshoots, so Android clamps it and both positions realign. A display
- * size change resets that, as does the first event.
+ *   "VM Touch"  a touchscreen with the tablet's own axis range: Android maps that range onto the
+ *               whole display, so a click lands exactly under the host cursor at any window size.
+ *               Left button = touch; right button = long press (context menu); no hover.
+ *   "VM Wheel"  a relative mouse that only scrolls. Scroll goes where Android's mouse cursor is, so
+ *               before each scroll that cursor is parked in the corner (Android clamps it) and moved
+ *               to the pointer's pixel: nothing accumulates between scrolls.
  *
- *   vm-mouse                    daemon (Android)
- *   vm-mouse --track W H        host test: stdin "x y" pixel targets -> stdout "dx dy" moves
- *   vm-mouse --scale MIN MAX W  host test: stdin raw tablet values -> stdout pixels
+ * Android ignores the tablet itself (no BTN_TOUCH, no REL axes). Earlier attempts: a hovering stylus
+ * (InputDispatcher aborted when a window changed under the pen) and an absolute -> relative mouse
+ * (drifted: moves made before Android opened the device were lost).
+ *
+ *   vm-mouse                         daemon (Android)
+ *   vm-mouse --scale MIN MAX W       host test: stdin raw tablet values -> stdout pixels
+ *   vm-mouse --wheel-moves X Y       host test: wheel cursor moves for pixel (X, Y)
+ *   vm-mouse --release-at DOWN UP    host test: when a right click's touch is lifted (ms)
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define SLAM 32000 /* beyond any display: Android clamps the cursor to the edge */
-#define EDGE 64
-
-struct tracker {
-	int w, h, x, y, synced;
-};
-
-static void tracker_reset(struct tracker *t, int w, int h)
-{
-	*t = (struct tracker){ .w = w, .h = h };
-}
+#define SLAM 32000          /* beyond any display: Android clamps the cursor to the edge */
+#define LONG_PRESS_MS 650   /* Android's long-press timeout is 400-500 ms */
 
 static int scale(long v, long min, long max, int size)
 {
@@ -40,48 +35,37 @@ static int scale(long v, long min, long max, int size)
 	return (int)((v - min) * (size - 1) / (max - min));
 }
 
-/* Relative moves (dx, dy pairs in out[]) that bring Android's cursor to (tx, ty); returns the count. */
-static int tracker_move(struct tracker *t, int tx, int ty, int out[4])
+/* Relative moves (dx, dy pairs) that put the wheel cursor on pixel (x, y). */
+static int wheel_moves(int x, int y, int out[4])
 {
-	int n = 0;
-	if (!t->synced) {
-		out[0] = -SLAM, out[1] = -SLAM;
-		n = 1;
-		t->x = t->y = 0;
-		t->synced = 1;
-	}
-	int dx = tx - t->x, dy = ty - t->y;
-	if (dx && tx == 0)
-		dx -= EDGE;
-	if (dx && tx == t->w - 1)
-		dx += EDGE;
-	if (dy && ty == 0)
-		dy -= EDGE;
-	if (dy && ty == t->h - 1)
-		dy += EDGE;
-	t->x = tx, t->y = ty;
-	if (dx || dy)
-		out[2 * n] = dx, out[2 * n + 1] = dy, n++;
-	return n;
+	out[0] = -SLAM, out[1] = -SLAM, out[2] = x, out[3] = y;
+	return 2;
+}
+
+/* A right click is a touch held at least LONG_PRESS_MS: when to lift it. */
+static long release_at(long down_ms, long up_ms)
+{
+	return up_ms > down_ms + LONG_PRESS_MS ? up_ms : down_ms + LONG_PRESS_MS;
 }
 
 #ifdef VM_MOUSE_HOST_TEST
 
 int main(int argc, char **argv)
 {
-	if (argc == 4 && !strcmp(argv[1], "--track")) {
-		struct tracker t;
-		tracker_reset(&t, atoi(argv[2]), atoi(argv[3]));
-		int x, y, out[4];
-		while (scanf("%d %d", &x, &y) == 2)
-			for (int i = 0, n = tracker_move(&t, x, y, out); i < n; i++)
-				printf("%d %d\n", out[2 * i], out[2 * i + 1]);
-		return 0;
-	}
 	if (argc == 5 && !strcmp(argv[1], "--scale")) {
 		long v;
 		while (scanf("%ld", &v) == 1)
 			printf("%d\n", scale(v, atol(argv[2]), atol(argv[3]), atoi(argv[4])));
+		return 0;
+	}
+	if (argc == 4 && !strcmp(argv[1], "--wheel-moves")) {
+		int out[4];
+		for (int i = 0, n = wheel_moves(atoi(argv[2]), atoi(argv[3]), out); i < n; i++)
+			printf("%d %d\n", out[2 * i], out[2 * i + 1]);
+		return 0;
+	}
+	if (argc == 4 && !strcmp(argv[1], "--release-at")) {
+		printf("%ld\n", release_at(atol(argv[2]), atol(argv[3])));
 		return 0;
 	}
 	return 2;
@@ -108,6 +92,13 @@ static void on_signal(int s)
 {
 	(void)s;
 	g_stop = 1;
+}
+
+static long now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int find_tablet(void)
@@ -161,7 +152,46 @@ static int display_size(int *w, int *h)
 	return ok;
 }
 
-static int make_mouse(void)
+static int ui_create(int fd, const char *name, int product)
+{
+	struct uinput_setup s;
+	memset(&s, 0, sizeof s);
+	snprintf(s.name, sizeof s.name, "%s", name);
+	s.id.bustype = BUS_USB;
+	s.id.vendor = 0x1d6b;
+	s.id.product = product;
+	s.id.version = 1;
+	if (ioctl(fd, UI_DEV_SETUP, &s) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int make_touch(const struct input_absinfo *ax, const struct input_absinfo *ay)
+{
+	int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	ioctl(fd, UI_SET_EVBIT, EV_KEY);
+	ioctl(fd, UI_SET_EVBIT, EV_ABS);
+	ioctl(fd, UI_SET_EVBIT, EV_SYN);
+	ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH);
+	ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+	const struct input_absinfo *info[2] = { ax, ay };
+	for (int axis = ABS_X; axis <= ABS_Y; axis++) {
+		struct uinput_abs_setup a;
+		memset(&a, 0, sizeof a);
+		a.code = axis;
+		a.absinfo.minimum = info[axis]->minimum;
+		a.absinfo.maximum = info[axis]->maximum;
+		ioctl(fd, UI_SET_ABSBIT, axis);
+		ioctl(fd, UI_ABS_SETUP, &a);
+	}
+	return ui_create(fd, "VM Touch", 0x0106);
+}
+
+static int make_wheel(void)
 {
 	int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0)
@@ -169,24 +199,11 @@ static int make_mouse(void)
 	ioctl(fd, UI_SET_EVBIT, EV_KEY);
 	ioctl(fd, UI_SET_EVBIT, EV_REL);
 	ioctl(fd, UI_SET_EVBIT, EV_SYN);
-	static const int keys[] = { BTN_LEFT, BTN_RIGHT, BTN_MIDDLE };
-	for (unsigned i = 0; i < sizeof keys / sizeof keys[0]; i++)
-		ioctl(fd, UI_SET_KEYBIT, keys[i]);
+	ioctl(fd, UI_SET_KEYBIT, BTN_LEFT); /* BTN_MOUSE + REL_X/REL_Y => Android "cursor" class */
 	static const int rels[] = { REL_X, REL_Y, REL_WHEEL, REL_HWHEEL };
 	for (unsigned i = 0; i < sizeof rels / sizeof rels[0]; i++)
 		ioctl(fd, UI_SET_RELBIT, rels[i]);
-	struct uinput_setup s;
-	memset(&s, 0, sizeof s);
-	snprintf(s.name, sizeof s.name, "VM Mouse");
-	s.id.bustype = BUS_USB;
-	s.id.vendor = 0x1d6b;
-	s.id.product = 0x0105;
-	s.id.version = 1;
-	if (ioctl(fd, UI_DEV_SETUP, &s) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
-		close(fd);
-		return -1;
-	}
-	return fd;
+	return ui_create(fd, "VM Wheel", 0x0104);
 }
 
 static void emit(int fd, int type, int code, int value)
@@ -198,11 +215,12 @@ static void emit(int fd, int type, int code, int value)
 		LOG("write failed: %s", strerror(errno));
 }
 
-static long now_ms(void)
+static void touch(int fd, int down, long x, long y)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	emit(fd, EV_ABS, ABS_X, (int)x);
+	emit(fd, EV_ABS, ABS_Y, (int)y);
+	emit(fd, EV_KEY, BTN_TOUCH, down);
+	emit(fd, EV_SYN, SYN_REPORT, 0);
 }
 
 static int run_once(void)
@@ -217,39 +235,30 @@ static int run_once(void)
 		return 1;
 	}
 	ioctl(tab, EVIOCGRAB, 1);
-	int mouse = make_mouse();
-	if (mouse < 0) {
-		LOG("cannot create the uinput mouse: %s", strerror(errno));
+	int tch = make_touch(&ax, &ay), whl = make_wheel();
+	if (tch < 0 || whl < 0) {
+		LOG("cannot create uinput devices: %s", strerror(errno));
 		close(tab);
 		return 1;
 	}
-	int w = 1440, h = 1080;
-	display_size(&w, &h);
-	struct tracker t;
-	tracker_reset(&t, w, h);
-	LOG("running, display %dx%d", w, h);
+	LOG("running");
 
-	long ax_v = 0, ay_v = 0, checked = now_ms();
-	int moved = 0, wheel = 0, hwheel = 0, rc = 0;
-	int buttons[3] = { 0 }, sent[3] = { 0 };
+	long x = 0, y = 0, right_down = 0, lift_at = 0;
+	int left = 0, touching = 0, wheel = 0, hwheel = 0, rc = 0;
 	struct pollfd pfd = { .fd = tab, .events = POLLIN };
 	while (!g_stop) {
-		if (poll(&pfd, 1, 1000) < 0 && errno != EINTR) {
+		int timeout = lift_at ? (int)(lift_at - now_ms()) : 1000;
+		if (poll(&pfd, 1, timeout > 0 ? timeout : 0) < 0 && errno != EINTR) {
 			rc = 1;
 			break;
+		}
+		if (lift_at && now_ms() >= lift_at) { /* end of a right click's long press */
+			touch(tch, 0, x, y);
+			touching = 0, lift_at = 0;
 		}
 		if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
 			rc = 1;
 			break;
-		}
-		if (now_ms() - checked > 2000) { /* the window (and so the display mode) can be resized */
-			int nw = w, nh = h;
-			if (!display_size(&nw, &nh) && (nw != w || nh != h)) {
-				w = nw, h = nh;
-				tracker_reset(&t, w, h);
-				LOG("display %dx%d", w, h);
-			}
-			checked = now_ms();
 		}
 		if (!(pfd.revents & POLLIN))
 			continue;
@@ -264,41 +273,51 @@ static int run_once(void)
 		for (size_t i = 0; i < (size_t)n / sizeof ev[0]; i++) {
 			struct input_event *e = &ev[i];
 			if (e->type == EV_ABS && e->code == ABS_X)
-				ax_v = e->value, moved = 1;
+				x = e->value;
 			else if (e->type == EV_ABS && e->code == ABS_Y)
-				ay_v = e->value, moved = 1;
+				y = e->value;
 			else if (e->type == EV_REL && e->code == REL_WHEEL)
 				wheel += e->value;
 			else if (e->type == EV_REL && e->code == REL_HWHEEL)
 				hwheel += e->value;
-			else if (e->type == EV_KEY && e->code >= BTN_LEFT && e->code <= BTN_MIDDLE)
-				buttons[e->code - BTN_LEFT] = e->value ? 1 : 0;
+			else if (e->type == EV_KEY && e->code == BTN_LEFT)
+				left = e->value != 0;
+			else if (e->type == EV_KEY && e->code == BTN_RIGHT && e->value && !touching)
+				right_down = now_ms(), touching = 2, touch(tch, 1, x, y);
+			else if (e->type == EV_KEY && e->code == BTN_RIGHT && !e->value && touching == 2)
+				lift_at = release_at(right_down, now_ms());
 			if (e->type != EV_SYN || e->code != SYN_REPORT)
 				continue;
-			/* Motion first, in its own reports, so a click lands where the cursor now is. */
-			if (moved) {
-				int out[4];
-				int tx = scale(ax_v, ax.minimum, ax.maximum, w), ty = scale(ay_v, ay.minimum, ay.maximum, h);
-				for (int k = 0, m = tracker_move(&t, tx, ty, out); k < m; k++) {
-					emit(mouse, EV_REL, REL_X, out[2 * k]);
-					emit(mouse, EV_REL, REL_Y, out[2 * k + 1]);
-					emit(mouse, EV_SYN, SYN_REPORT, 0);
-				}
-				moved = 0;
+			/* Left button: the touch follows it; moving while down is a drag. */
+			if (touching != 2 && (left || touching)) {
+				touch(tch, left, x, y);
+				touching = left;
 			}
-			for (int b = 0; b < 3; b++)
-				if (buttons[b] != sent[b])
-					emit(mouse, EV_KEY, BTN_LEFT + b, buttons[b]), sent[b] = buttons[b];
-			if (wheel)
-				emit(mouse, EV_REL, REL_WHEEL, wheel);
-			if (hwheel)
-				emit(mouse, EV_REL, REL_HWHEEL, hwheel);
-			wheel = hwheel = 0;
-			emit(mouse, EV_SYN, SYN_REPORT, 0);
+			if (wheel || hwheel) {
+				int px = scale(x, ax.minimum, ax.maximum, 1920), py = scale(y, ay.minimum, ay.maximum, 1080);
+				int w = 1920, h = 1080, out[4];
+				if (!display_size(&w, &h)) {
+					px = scale(x, ax.minimum, ax.maximum, w);
+					py = scale(y, ay.minimum, ay.maximum, h);
+				}
+				for (int k = 0, m = wheel_moves(px, py, out); k < m; k++) {
+					emit(whl, EV_REL, REL_X, out[2 * k]);
+					emit(whl, EV_REL, REL_Y, out[2 * k + 1]);
+					emit(whl, EV_SYN, SYN_REPORT, 0);
+				}
+				if (wheel)
+					emit(whl, EV_REL, REL_WHEEL, wheel);
+				if (hwheel)
+					emit(whl, EV_REL, REL_HWHEEL, hwheel);
+				emit(whl, EV_SYN, SYN_REPORT, 0);
+				wheel = hwheel = 0;
+			}
 		}
 	}
-	ioctl(mouse, UI_DEV_DESTROY);
-	close(mouse);
+	ioctl(tch, UI_DEV_DESTROY);
+	ioctl(whl, UI_DEV_DESTROY);
+	close(tch);
+	close(whl);
 	close(tab);
 	return rc;
 }

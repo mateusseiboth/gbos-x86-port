@@ -50,7 +50,7 @@ SELinux failures.
 | `boot/initrd.py` | adds the layer to the ramdisk's first-stage fstab |
 | `boot/progress.py` | prints the boot phases from the serial log while QEMU runs |
 | `boot/cmdline.txt` | kernel arguments shared by the VM and the pendrive |
-| `pointer/vm_mouse.c` | usb-tablet -> relative "VM Mouse" for Android (`pointer/build.sh`) |
+| `pointer/vm_mouse.c` | usb-tablet -> "VM Touch" touchscreen + "VM Wheel" for Android (`pointer/build.sh`) |
 | `layer/bootanimation.py` | the stock boot animation plus a held frame that loops until boot completes |
 | `run_vm.sh` | launcher |
 
@@ -76,13 +76,15 @@ animation until Android is ready.
 counters), `GBOS_ONCE=1` (no relaunch after a guest reboot). Serial log:
 `$GBOS_ROOT/vm/logs/<name>/serial.log`.
 
-The mouse is QEMU's `usb-tablet` (absolute, no grab: a captured relative mouse cannot work under
-Wayland, which forbids warping the pointer, so the visible cursor and Android's drifted apart).
-`pointer/vm_mouse.c` (in the layer as `/vendor/bin/vm-mouse`) re-emits it as a plain relative mouse:
-the cursor is parked in the corner first, moved by pixel deltas with Android's pointer acceleration off,
-and every move to a display edge overshoots so both realign. The upstream tablet + `pointer-bridge`
-path showed up as a hovering stylus, and system_server's InputDispatcher aborted (`Expected
-ACTION_HOVER_MOVE instead of MotionEvent`) when a window changed under it.
+The mouse is QEMU's `usb-tablet` (absolute, no grab; a captured relative mouse cannot work under
+Wayland, which forbids warping the pointer). `pointer/vm_mouse.c` (`/vendor/bin/vm-mouse` in the layer)
+re-emits it as a touchscreen with the tablet's own axis range, so Android maps it onto the whole
+display and a click lands exactly under the host cursor at any window size: left button = touch/drag,
+right button = long press (context menu), no hover. The wheel goes through a separate relative mouse
+whose cursor is parked in the corner and moved to the pointer's pixel before each scroll. Earlier
+attempts: the upstream hovering stylus (system_server's InputDispatcher aborted, `Expected
+ACTION_HOVER_MOVE instead of MotionEvent`, when a window changed under the pen) and an absolute ->
+relative mouse (drifted: moves sent before Android opened the device were lost).
 
 VM-only behavior (fake battery, no suspend, screen always on, vm-mouse) runs on
 `androidboot.gbos.vm=1`, which `run_vm.sh` passes and the pendrive does not.
