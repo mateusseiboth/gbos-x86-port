@@ -57,7 +57,7 @@ Tests: `python3 -m unittest` in `kernel/`, `layer/` and `boot/`.
 ## Run
 
 ```sh
-vm-amd/run_vm.sh                                   # SDL window, /data persists in vm/data.qcow2
+vm-amd/run_vm.sh                                   # GTK window, /data persists in vm/data.qcow2
 GBOS_FRESH=1 vm-amd/run_vm.sh                      # start with a clean /data
 GBOS_NET_ARGS="-nic none" vm-amd/run_vm.sh         # offline
 GBOS_DISPLAY_ARGS="-display egl-headless -vnc 127.0.0.1:7" vm-amd/run_vm.sh
@@ -75,8 +75,9 @@ counters), `GBOS_ONCE=1` (no relaunch after a guest reboot). Serial log:
 `$GBOS_ROOT/vm/logs/<name>/serial.log`.
 
 The mouse is QEMU's `usb-mouse`, a real relative mouse for Android (cursor, hover, right click, wheel,
-acceleration): click the window to capture it, Ctrl+Alt+G releases it. `show-cursor=on` keeps the
-cursor visible while captured (it is Android's, drawn on the virtio-gpu cursor plane). The tablet + `pointer-bridge`
+acceleration): click the window to capture it, Ctrl+Alt+G releases it. The window is QEMU's GTK UI
+with `show-cursor=on`: the cursor is Android's (virtio-gpu cursor plane). SDL hides it on grab, or with
+`show-cursor=on` feeds its own pointer warps back to the guest and the cursor drifts. The tablet + `pointer-bridge`
 path showed up as a hovering stylus, and system_server's InputDispatcher aborted (`Expected
 ACTION_HOVER_MOVE instead of MotionEvent`) when a window changed under it.
 

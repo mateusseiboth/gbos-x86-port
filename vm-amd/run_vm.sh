@@ -47,9 +47,10 @@ AVAIL_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 
 : "${GBOS_XRES:=1440}" "${GBOS_YRES:=1080}"
 : "${GBOS_GPU_ARGS:=-device virtio-gpu-gl-pci,hostmem=${GBOS_HOSTMEM:-2G},blob=true,venus=true,addr=0x1,xres=$GBOS_XRES,yres=$GBOS_YRES}"
-# show-cursor=on: without it SDL switches to relative mode on grab and hides the cursor, which is the
-# guest's (virtio-gpu cursor plane); with it SDL shows the guest cursor and warps to its position.
-: "${GBOS_DISPLAY_ARGS:=-display sdl,gl=on,show-cursor=on}"
+# GTK, show-cursor=on: the cursor is the guest's (virtio-gpu cursor plane). SDL either hides it on grab
+# (relative mode) or, with show-cursor=on, feeds its own warps back as motion and the cursor drifts;
+# GTK shows it and remembers where it warped to.
+: "${GBOS_DISPLAY_ARGS:=-display gtk,gl=on,show-cursor=on}"
 # usb-mouse: a real relative mouse for Android (click the window to capture it, Ctrl+Alt+G releases).
 : "${GBOS_INPUT_ARGS:=-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0}"
 : "${GBOS_NET_ARGS:=-netdev user,id=net0,ipv6=off -device virtio-net-pci,netdev=net0}"
