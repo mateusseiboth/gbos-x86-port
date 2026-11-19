@@ -36,6 +36,7 @@ the boot-control HAL marked `_b` successful.
 | `kernel/patches/gbos-amd-vm.patch` | the whole kernel tree delta (gfni_emu, overlayfs caller creds, 0001) |
 | `kernel/fedora_drivers.py` | config fragment with Fedora's hardware drivers as modules, CRC-safe (see below) |
 | `kernel/collect_firmware.py` | stages linux-firmware uncompressed for the GKI kernel |
+| `kernel/resolve_modules.py` | picks ours or Google's for every module name both sides ship |
 | `zlib-build/build.sh` | `patches/build_libz.sh` pointed at a local AOSP `external/zlib` checkout |
 | `layer/build_layer.py` | builds `vm/layer.img` |
 | `boot/slot.py` | A/B selection from `misc` + vbmeta size/digest of the chosen slot |
@@ -67,6 +68,17 @@ mkdir -p ../out && cp $GBOS_ROOT/gbos-x86-port/kernel/shipped_kernel_config.txt 
 scripts/kconfig/merge_config.sh -m -O ../out ../out/.config $GBOS_ROOT/tuned/kernel/gbos-vm.config
 $GBOS_ROOT/tuned/kernel/kmake.sh olddefconfig && $GBOS_ROOT/tuned/kernel/kmake.sh -j11 bzImage modules
 python3 $GBOS_ROOT/gbos-x86-port/kernel/check_crc.py ../out/Module.symvers <dir with Google's .ko>   # expect crc-mismatch=0
+
+# kernel with Fedora's drivers (separate build dir)
+python3 $GBOS_ROOT/tuned/kernel/fedora_drivers.py /boot/config-$(uname -r) ../out/.config $GBOS_ROOT/tuned/kernel/fedora-drivers.config
+mkdir -p ../out-full && scripts/kconfig/merge_config.sh -m -O ../out-full ../out/.config $GBOS_ROOT/tuned/kernel/fedora-drivers.config
+KOUT=$GBOS_ROOT/kernel/out-full $GBOS_ROOT/tuned/kernel/kmake.sh olddefconfig
+python3 $GBOS_ROOT/tuned/kernel/fedora_drivers.py check ../out/.config ../out-full/.config         # expect "core unchanged"
+KOUT=$GBOS_ROOT/kernel/out-full $GBOS_ROOT/tuned/kernel/kmake.sh -j11 bzImage modules
+KOUT=$GBOS_ROOT/kernel/out-full $GBOS_ROOT/tuned/kernel/kmake.sh INSTALL_MOD_PATH=$GBOS_ROOT/dlkm/staging INSTALL_MOD_STRIP=1 modules_install
+python3 $GBOS_ROOT/tuned/kernel/resolve_modules.py $GBOS_ROOT/dlkm/staging/lib/modules/<release> <dirs with Google's .ko> \
+  --symvers ../out-full/Module.symvers --out $GBOS_ROOT/dlkm/modules.selection
+python3 $GBOS_ROOT/tuned/kernel/collect_firmware.py /lib/firmware $GBOS_ROOT/dlkm/firmware $GBOS_ROOT/dlkm/staging/lib/modules/<release>
 
 # image inputs: gbos-vm-linux README steps 1-6 (the security-ported image is only read by build_layer.py)
 cp --sparse=always $GBOS_ROOT/gbos-vm-linux/android-desktop_signed_recovery_image.bin $GBOS_ROOT/vm/stock/googlebook.bin
@@ -123,6 +135,15 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   of CRCs (gendwarfksyms walks the whole graph), so those are kept at their GKI value (`CORE_PROTECTED`,
   found by diffing `pahole --sizes` and `gendwarfksyms --symtypes` between the two builds) together with
   every driver that selects them; `fedora_drivers.py check` verifies the merged config.
+* **Fedora modules vs Google's** (`kernel/resolve_modules.py`): ~540 module names exist on both sides
+  (DRM helpers, cfg80211, bluetooth, SOF, virtio, ...) and only one of each can load. Starting from
+  Google's, a name switches to ours when that lets more modules load without breaking a Google module;
+  a module counts as loadable only if every need is met by modules that load (fixpoint). Result on the
+  lapis build: 3958 names, 20 use ours (`cfg80211`, `iwlwifi`/`iwlmvm`/`iwlmld`, `drm_ttm_helper`, `ptp`,
+  `rust_binder`, ...), 36 of ours dropped (niche Bluetooth, Qualcomm codecs, `cs8409`, AMD SOF/ACP: the
+  SOF core stays Google's because its Intel SOF drivers depend on it). Output: `dlkm/modules.selection`.
+* Firmware: `collect_firmware.py` stages Fedora's linux-firmware (7404 entries, 1.1 GB uncompressed);
+  476 names declared by modules are not packaged by Fedora (mostly NVIDIA, DVB, legacy b43/Broadcom).
 * `TRIM_UNUSED_KSYMS` off (Google's KMI list is not public). `WERROR` / `OBJTOOL_WERROR` off (Fedora's
   clang 23 has warnings clang 22 lacks; codegen is unchanged). `protected_module_names_list` is empty.
 * `patches/apply_*_update.py` cannot run on a fresh checkout: they read binaries the author patched by hand.
