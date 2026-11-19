@@ -1,0 +1,26 @@
+--- a/src/vrend/vrend_winsys.c	2026-11-19 16:06:27.857777397 -0400
++++ b/src/vrend/vrend_winsys.c	2026-11-19 16:06:38.957394360 -0400
+@@ -111,6 +111,10 @@
+       free(egl);
+       egl = NULL;
+       use_context = CONTEXT_NONE;
++      if (gbm) {
++         virgl_gbm_fini(gbm);
++         gbm = NULL;
++      }
+    }
+ #endif
+ #ifdef HAVE_EPOXY_GLX_H
+@@ -125,6 +129,12 @@
+ int vrend_winsys_init_external(void *egl_display)
+ {
+ #ifdef HAVE_EPOXY_EGL_H
++#ifdef ENABLE_GBM
++      /* The embedder (QEMU) owns the EGL display, but GBM allocation still needs a GBM device:
++       * without it no vrend resource can be exported, so venus cannot import guest buffers
++       * (Android gralloc, swapchains) and its ring goes fatal. Optional: EGL works without it. */
++      gbm = virgl_gbm_init(-1);
++#endif
+       egl = virgl_egl_init_external(egl_display);
+       if (!egl)
+          return -1;

@@ -2,7 +2,7 @@
 """Build the gbos overlay layer: everything vm-amd adds to a *stock* lapis image, as one erofs
 (with SELinux labels) that the first-stage fstab mounts over /vendor and /odm.
 
-  build_layer.py OUT_DISK_IMG [--policy-check]
+  build_layer.py OUT_DISK_IMG [--vulkan]     (vm/layer.img: GL over virgl; vm/layer-vulkan.img: --vulkan)
 
 The stock system_a / vendor_a stay byte-identical, so an OTA can verify and apply, and the layer
 applies to whichever slot boots. /system itself cannot be overlaid on a user build (fs_mgr
@@ -305,8 +305,20 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
     return files
 
 
-def odm_files(overrides: dict, contexts: list):
-    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'})
+# --vulkan: apps (HWUI) and SurfaceFlinger render with Vulkan through Venus (vulkan.virtio.so -> the
+# host's Vulkan driver). Needs QEMU on the patched virglrenderer (vm-amd/virgl, GBOS_VULKAN=1): the
+# stock one cannot export guest buffers to Venus and SurfaceFlinger aborts importing them.
+VULKAN_PROPS = {
+    'debug.hwui.renderer': 'skiavk',
+    'ro.hwui.use_vulkan': 'true',
+    'debug.renderengine.backend': 'skiavkthreaded',
+    'debug.renderengine.vulkan': 'true',
+    'ro.hardware.vulkan': 'virtio',
+}
+
+
+def odm_files(overrides: dict, contexts: list, vulkan: bool = False):
+    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'}, **(VULKAN_PROPS if vulkan else {}))
     return {
         'etc/build.prop': (odm_build_prop(prop).encode(), 'vendor_configs_file', 0o644, 0, 0),
         'etc/selinux/odm_file_contexts': (''.join(l + '\n' for l in contexts).encode(), 'vendor_configs_file', 0o644, 0, 0),
@@ -400,6 +412,7 @@ def build_disk(erofs: Path, disk: Path):
 
 def main():
     out = Path(sys.argv[1])
+    vulkan = '--vulkan' in sys.argv[2:]
     for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VENDOR_MODULES,
                  FIRMWARE):
         if not need.exists():
@@ -412,7 +425,7 @@ def main():
         pfiles, overrides, contexts = port_files(port_vendor, stock_vendor)
         vendor = {**pfiles, **gbos_vendor_files(stock_vendor, stock_system), **driver_files(stock_vendor)}
         files = {layer_path('vendor', k): v for k, v in vendor.items()}
-        files.update({layer_path('odm', k): v for k, v in odm_files(overrides, contexts).items()})
+        files.update({layer_path('odm', k): v for k, v in odm_files(overrides, contexts, vulkan).items()})
         build_erofs(layer_dirs(vendor, stock_vendor, stock_system), files, tmp / 'layer.erofs', tmp)
         build_disk(tmp / 'layer.erofs', out)
         print(f'layer: {len(files)} files, {len(overrides)} prop overrides, {len(contexts)} file contexts -> {out}')

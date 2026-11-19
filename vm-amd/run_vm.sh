@@ -13,12 +13,21 @@
 #   GBOS_NET_ARGS      e.g. "-nic none" for offline         
 #   GBOS_LOGLEVEL      kernel console loglevel (7 shows gfni_emu counters)
 #   GBOS_ONCE=1        do not relaunch after a guest reboot
+#   GBOS_VULKAN=1      Vulkan rendering (vm/layer-vulkan.img + vm-amd/virgl)
 set -eu
 GBOS="${GBOS_ROOT:-/mnt/dados/gbos}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 NAME="${1:-daily}"
 BASE="${GBOS_BASE:-$GBOS/vm/stock/googlebook.bin}"
 LAYER="${GBOS_LAYER:-$GBOS/vm/layer.img}"
+# GBOS_VULKAN=1: the --vulkan layer (Android renders with Vulkan through Venus) on the patched
+# virglrenderer from vm-amd/virgl (build.sh); QEMU alone loads it, the system library is untouched.
+if [ "${GBOS_VULKAN:-0}" = 1 ]; then
+  LAYER="${GBOS_LAYER:-$GBOS/vm/layer-vulkan.img}"
+  [ -f "$HERE/virgl/out/lib/libvirglrenderer.so.1" ] || { echo "run vm-amd/virgl/build.sh first" >&2; exit 1; }
+  export LD_LIBRARY_PATH="$HERE/virgl/out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export VIRGL_GBM_LAYOUT_FORCE_ENABLE=1
+fi
 INITRD="${GBOS_INITRD:-$GBOS/vm/initrd}"
 KERNEL="${GBOS_KERNEL:-$GBOS/kernel/out-full/arch/x86/boot/bzImage}"
 OVERLAY="${GBOS_OVERLAY:-$GBOS/vm/data.qcow2}"

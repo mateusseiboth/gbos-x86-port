@@ -95,6 +95,15 @@ class GraphicsTest(unittest.TestCase):
         self.assertIn(b"debug.hwui.renderer=skiagl\n", prop)
         self.assertNotIn(b"skiavk", prop)
 
+    def test_the_vulkan_layer_renders_with_vulkan_through_venus(self):
+        # Needs the patched virglrenderer (vm-amd/virgl): GBOS_VULKAN=1 run_vm.sh.
+        prop = odm_files({"debug.hwui.renderer": "skiagl"}, [], vulkan=True)["etc/build.prop"][0]
+        for line in (b"debug.hwui.renderer=skiavk", b"ro.hwui.use_vulkan=true",
+                     b"debug.renderengine.backend=skiavkthreaded", b"debug.renderengine.vulkan=true",
+                     b"ro.hardware.vulkan=virtio"):
+            self.assertIn(line + b"\n", prop)
+        self.assertNotIn(b"skiagl", prop)
+
 
 class PointerTest(unittest.TestCase):
     def test_the_layer_ships_no_pointer_bridge(self):

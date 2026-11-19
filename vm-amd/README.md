@@ -44,7 +44,8 @@ SELinux failures.
 | `kernel/collect_firmware.py` | stages linux-firmware uncompressed for the GKI kernel |
 | `kernel/resolve_modules.py` | picks ours or Google's for every module name both sides ship; writes the combined `/vendor/lib/modules` |
 | `zlib-build/build.sh` | `patches/build_libz.sh` pointed at a local AOSP `external/zlib` checkout |
-| `layer/build_layer.py` | builds `vm/layer.img` |
+| `layer/build_layer.py` | builds `vm/layer.img` (`--vulkan`: `vm/layer-vulkan.img`) |
+| `virgl/` | virglrenderer 1.3.0 + `external-egl-gbm.patch` for Vulkan (Venus) under QEMU; `build.sh` -> `virgl/out` |
 | `boot/slot.py` | A/B selection from `misc` + vbmeta size/digest of the chosen slot |
 | `boot/initrd.py` | adds the layer to the ramdisk's first-stage fstab |
 | `boot/progress.py` | prints the boot phases from the serial log while QEMU runs |
@@ -60,6 +61,7 @@ vm-amd/run_vm.sh                                   # SDL window, /data persists 
 GBOS_FRESH=1 vm-amd/run_vm.sh                      # start with a clean /data
 GBOS_NET_ARGS="-nic none" vm-amd/run_vm.sh         # offline
 GBOS_DISPLAY_ARGS="-display egl-headless -vnc 127.0.0.1:7" vm-amd/run_vm.sh
+GBOS_VULKAN=1 vm-amd/run_vm.sh                     # Vulkan rendering (layer-vulkan.img + virgl/out)
 python3 host/vnc.py shot out.png --port 5907       # headless screenshot
 ```
 
@@ -107,6 +109,8 @@ git clone --depth 1 https://android.googlesource.com/platform/external/zlib $GBO
 ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash $GBOS_ROOT/tuned/zlib-build/build.sh
 ANDROID_NDK=$GBOS_ROOT/gbos-vm-linux/android-ndk-r30 bash $GBOS_ROOT/tuned/layer/stubs/build.sh
 python3 $GBOS_ROOT/tuned/layer/build_layer.py $GBOS_ROOT/vm/layer.img
+python3 $GBOS_ROOT/tuned/layer/build_layer.py $GBOS_ROOT/vm/layer-vulkan.img --vulkan   # optional
+$GBOS_ROOT/tuned/virgl/build.sh                                                       # for GBOS_VULKAN=1
 python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_ROOT/vm/initrd
 ```
 
@@ -118,9 +122,13 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   `/odm/etc/build.prop` (loaded after `/vendor/build.prop`), `vendor_file_contexts` additions (device
   labels: `/dev/ttyS0`, the virtio-gpu sysfs node) -> `/odm/etc/selinux/odm_file_contexts`.
 * `ro.dalvik.vm.native.bridge=0` (libhoudini makes zygote abort silently).
-* Rendering stays on GL over virgl (the security port's choice). Vulkan through its Venus driver
-  crashes SurfaceFlinger in `vkGetAndroidHardwareBufferPropertiesANDROID` (gralloc buffers) and the
-  guest boot-loops.
+* Rendering: `vm/layer.img` keeps GL over virgl (the security port's choice); `vm/layer-vulkan.img`
+  (`build_layer.py --vulkan`, run with `GBOS_VULKAN=1`) renders apps and SurfaceFlinger with Vulkan
+  through Venus. That needs `vm-amd/virgl`: QEMU hands virglrenderer its own EGL display, and in that
+  mode virglrenderer never created a GBM device, so no guest buffer could be exported to Venus;
+  SurfaceFlinger aborted importing a gralloc buffer (`vkGetMemoryResourcePropertiesMESA`, invalid
+  res_id) and the guest boot-looped. `virgl/external-egl-gbm.patch` creates the GBM device in that mode
+  too, and `VIRGL_GBM_LAYOUT_FORCE_ENABLE=1` allocates shared/scanout buffers through it.
 * Baseline `libz.so` for `/vendor/lib64`, and for `/system/lib64` through a bind mount at `early-init`:
   `/system` cannot be overlaid on a user build (fs_mgr allowlist).
 * Boot animation: the stock one fades to black after ~5 s (enough for a real Googlebook); the layer's
