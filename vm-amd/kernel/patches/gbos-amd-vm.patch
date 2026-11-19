@@ -693,6 +693,59 @@ index 000000000..34a3784b6
 +#include "gfni_emu.c"
 +
 +core_initcall(real_gfni_emu_init);
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index d1eb1cbe7..dedd17114 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -445,9 +445,18 @@ struct dentry *ovl_workdir(struct dentry *dentry);
+ const struct cred *ovl_override_creds(struct super_block *sb);
+ void ovl_revert_creds(const struct cred *old_cred);
+ 
++extern bool ovl_gbos_caller_creds;
++
++/*
++ * gbos: with overlay.gbos_caller_creds=1, access to the layers is checked with the
++ * caller's credentials instead of the mounter's (what Android's override_creds=off
++ * used to do). Android's first-stage init mounts fstab overlays before any SELinux
++ * policy is loaded, so the mounter is u:r:kernel:s0, which the policy does not let
++ * read vendor files on behalf of apexd, ueventd and friends.
++ */
+ static inline const struct cred *ovl_creds(struct super_block *sb)
+ {
+-	return OVL_FS(sb)->creator_cred;
++	return ovl_gbos_caller_creds ? current_cred() : OVL_FS(sb)->creator_cred;
+ }
+ 
+ int ovl_can_decode_fh(struct super_block *sb);
+diff --git a/fs/overlayfs/util.c b/fs/overlayfs/util.c
+index 19f4fe7b9..743f0c931 100644
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -16,6 +16,7 @@
+ #include <linux/namei.h>
+ #include <linux/ratelimit.h>
+ #include <linux/overflow.h>
++#include <linux/moduleparam.h>
+ #include "overlayfs.h"
+ 
+ /* Get write access to upper mnt - may fail if upper sb was remounted ro */
+@@ -62,11 +63,13 @@ struct dentry *ovl_workdir(struct dentry *dentry)
+ 	return ofs->workdir;
+ }
+ 
++bool ovl_gbos_caller_creds;
++module_param_named(gbos_caller_creds, ovl_gbos_caller_creds, bool, 0444);
++MODULE_PARM_DESC(gbos_caller_creds, "Check layer access with the caller's credentials (gbos)");
++
+ const struct cred *ovl_override_creds(struct super_block *sb)
+ {
+-	struct ovl_fs *ofs = OVL_FS(sb);
+-
+-	return override_creds(ofs->creator_cred);
++	return override_creds(ovl_creds(sb));
+ }
+ 
+ void ovl_revert_creds(const struct cred *old_cred)
 diff --git a/kernel/module/main.c b/kernel/module/main.c
 index 8a368767b..4e809095d 100644
 --- a/kernel/module/main.c
