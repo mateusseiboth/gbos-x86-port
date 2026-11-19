@@ -136,5 +136,38 @@ class GpuDetectionTest(unittest.TestCase):
         self.assertEqual(self.gpu([("0000:00:1f.0", 0x8086, 0x060100)]), "swiftshader")
 
 
+@unittest.skipUnless(CC, "needs cc")
+class BatteryDetectionTest(unittest.TestCase):
+    # A desktop has no battery: Android then reads 0 % and setup refuses to go on, so the layer loads
+    # a fake full battery on AC (test_power) on androidboot.gbos.battery=none.
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.exe = cls.tmp / "gbos-boot"
+        subprocess.run([CC, "-O2", "-o", str(cls.exe), str(HERE / "gbos_boot.c")], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def battery(self, supplies):
+        root = Path(tempfile.mkdtemp(dir=self.tmp))
+        for name, kind, *scope in supplies:
+            (root / name).mkdir()
+            (root / name / "type").write_text(kind + "\n")
+            if scope:
+                (root / name / "scope").write_text(scope[0] + "\n")
+        return subprocess.run([str(self.exe), "--battery", str(root)], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def test_a_desktop_has_none(self):
+        self.assertEqual(self.battery([]), "none")
+        # A wireless mouse's battery is a Battery of scope Device, not the system's.
+        self.assertEqual(self.battery([("ADP1", "Mains"), ("hidpp_battery_0", "Battery", "Device")]), "none")
+
+    def test_a_laptop_has_one(self):
+        self.assertEqual(self.battery([("AC", "Mains"), ("BAT0", "Battery")]), "present")
+
+
 if __name__ == "__main__":
     unittest.main()

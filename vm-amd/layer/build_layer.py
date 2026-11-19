@@ -17,6 +17,7 @@ Inputs (env, defaults under GBOS_ROOT):
   GBOS_GSCUTIL_STUB    layer/stubs/out/gscutil (layer/stubs/build.sh)
   GBOS_VM_MOUSE        pointer/out/vm-mouse (pointer/build.sh)
   GBOS_SWIFTSHADER     graphics/vulkan.pastel.so (layer/fetch_swiftshader.py)
+  GBOS_RADV            vm-amd/graphics/out/vulkan.radv.so (graphics/build_radv.sh)
   GBOS_VENDOR_MODULES  combined /vendor/lib/modules (kernel/resolve_modules.py --vendor-out)
   GBOS_FIRMWARE        firmware tree (kernel/collect_firmware.py), added under /vendor/firmware
 """
@@ -45,6 +46,7 @@ FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futi
 GSCUTIL_STUB = Path(os.environ.get('GBOS_GSCUTIL_STUB', HERE / 'stubs/out/gscutil'))
 VM_MOUSE = Path(os.environ.get('GBOS_VM_MOUSE', HERE.parent / 'pointer/out/vm-mouse'))
 SWIFTSHADER = Path(os.environ.get('GBOS_SWIFTSHADER', ROOT / 'graphics/vulkan.pastel.so'))
+RADV = Path(os.environ.get('GBOS_RADV', HERE.parent / 'graphics/out/vulkan.radv.so'))
 VENDOR_MODULES = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
 FIRMWARE = Path(os.environ.get('GBOS_FIRMWARE', ROOT / 'dlkm/firmware'))
 SUPER_BASE = 1458176 * 512
@@ -88,14 +90,15 @@ on property:sys.boot_completed=1
     stop timberslide
 '''.encode()
 
-# gbos: power in a VM. QEMU has no battery and the ChromeOS EC is missing, so the battery read 0 %
-# and setup refused to go on; test_power (kernel/fedora_drivers.py VM_EXTRAS) gives the health HAL
-# a full battery on AC through /sys/class/power_supply. The guest never suspends (s2idle left the
-# window blank mid-update) and the screen stays on while "plugged in".
+# gbos: power. With no battery (QEMU, desktops: androidboot.gbos.battery=none from run_vm.sh /
+# usb/gbos_boot.c) the battery read 0 % and setup refused to go on; test_power
+# (kernel/fedora_drivers.py VM_EXTRAS) gives the health HAL a full battery on AC through
+# /sys/class/power_supply. In the VM only (androidboot.gbos.vm=1) the guest never suspends (s2idle
+# left the window blank mid-update) and the screen stays on while "plugged in".
 TEST_POWER_OPTIONS = 'options test_power ac_online=on battery_status=full battery_capacity=100\n'
 
 VM_POWER_RC = (
-    b'on early-boot && property:ro.boot.gbos.vm=1\n'
+    b'on early-boot && property:ro.boot.gbos.battery=none\n'
     b'    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -d /vendor/lib/modules test_power\n\n'
     b'on boot && property:ro.boot.gbos.vm=1\n'
     b'    write /sys/power/wake_lock gbos_vm\n\n'
@@ -341,8 +344,9 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
         # OTA postinstall flashes the AP firmware through futility; there is none (stubs/futility.c).
         'bin/futility': _entry(stock_vendor, 'bin/futility', FUTILITY_STUB.read_bytes()),
         SYSTEM_GSCUTIL: _entry(stock_system, 'system/bin/gscutil', GSCUTIL_STUB.read_bytes()),
-        # Graphics for GPUs without drivers in the image (gpu_amd/swiftshader.prop).
+        # Graphics for GPUs without drivers in the image (gpu_amd.prop, gpu_swiftshader.prop).
         'lib64/hw/vulkan.pastel.so': _entry(stock_vendor, 'lib64/hw/vulkan.intel.so', SWIFTSHADER.read_bytes()),
+        'lib64/hw/vulkan.radv.so': _entry(stock_vendor, 'lib64/hw/vulkan.intel.so', RADV.read_bytes()),
         'lib64/libminigbm_gralloc.so': _entry(stock_vendor, 'lib64/libminigbm_gralloc.so', patch_minigbm(
             port.dump_cat(stock_vendor, '/lib64/libminigbm_gralloc.so'))),
         SYSTEM_GSCUTIL_REAL: _entry(stock_system, 'system/bin/gscutil', b''),  # mount point
@@ -367,8 +371,21 @@ VULKAN_PROPS = {
     'ro.hardware.vulkan': 'virtio',
 }
 
-# amd / swiftshader: ANGLE (in /system) on SwiftShader Vulkan (vulkan.pastel.so, from Cuttlefish), as
-# Cuttlefish's guest_swiftshader mode. The image has no Mesa for AMD GPUs yet.
+# amd: RADV (graphics/build_radv.sh, /vendor/lib64/hw/vulkan.radv.so) as the Vulkan HAL, GLES through
+# ANGLE (in /system) on top of it: the Radeon renders in hardware. Buffers come from minigbm's dumb
+# backend (linear), which RADV imports.
+RADV_PROPS = {
+    'ro.hardware.egl': 'angle',
+    'ro.hardware.vulkan': 'radv',
+    'ro.gfx.angle.supported': 'true',
+    'debug.hwui.renderer': 'skiagl',
+    'ro.hwui.use_vulkan': 'false',
+    'debug.renderengine.backend': 'skiaglthreaded',
+    'debug.renderengine.vulkan': 'false',
+}
+
+# swiftshader: ANGLE on SwiftShader Vulkan (vulkan.pastel.so, from Cuttlefish), as Cuttlefish's
+# guest_swiftshader mode: the last resort for GPUs the image has no driver for.
 SOFTWARE_PROPS = {
     'ro.hardware.egl': 'angle',
     'ro.hardware.vulkan': 'pastel',
@@ -384,7 +401,7 @@ def gpu_props(overrides: dict) -> dict:
     """{stack: props}. virgl is the security port's GL-over-virgl stack; intel keeps the stock drivers."""
     virgl = {k: v for k, v in overrides.items() if k in GPU_KEYS}
     return {'virgl': virgl, 'venus': dict(virgl, **VULKAN_PROPS), 'intel': {},
-            'amd': SOFTWARE_PROPS, 'swiftshader': SOFTWARE_PROPS}
+            'amd': RADV_PROPS, 'swiftshader': SOFTWARE_PROPS}
 
 
 def patch_minigbm(lib: bytes) -> bytes:
@@ -507,7 +524,7 @@ def build_disk(erofs: Path, disk: Path):
 
 def main():
     out = Path(sys.argv[1])
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VM_MOUSE, SWIFTSHADER, VENDOR_MODULES,
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, FUTILITY_STUB, GSCUTIL_STUB, VM_MOUSE, SWIFTSHADER, RADV, VENDOR_MODULES,
                  FIRMWARE):
         if not need.exists():
             raise SystemExit(f'missing {need}')

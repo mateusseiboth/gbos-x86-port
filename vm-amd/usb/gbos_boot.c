@@ -12,6 +12,7 @@
  *   gbos-boot --plan DISK [--write] print SLOT/VBMETA_SIZE/VBMETA_DIGEST for a disk image (tests)
  *   gbos-boot --boot-device SYSPATH print the androidboot.boot_devices value for a block device
  *   gbos-boot --gpu PCI_DEVICES_DIR print the graphics stack for androidboot.gbos.gpu
+ *   gbos-boot --battery PSU_DIR     print "present" or "none" for androidboot.gbos.battery
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -305,6 +306,45 @@ static const char *gpu_stack(const char *pci_root)
 	return best;
 }
 
+/* ---- battery ---------------------------------------------------------------------------- */
+
+static int read_word(const char *dir, const char *name, char *out, size_t len)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof path, "%s/%s", dir, name);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return -1;
+	int ok = fscanf(f, "%31s", out) == 1 ? 0 : -1;
+	fclose(f);
+	(void)len;
+	return ok;
+}
+
+/* A system battery: a power supply of type Battery whose scope is not Device (a wireless mouse's
+ * battery is). Without one Android reads 0 % and setup refuses to continue; the layer then loads a
+ * fake full battery on AC (androidboot.gbos.battery=none). */
+static const char *battery_state(const char *psu_root)
+{
+	DIR *dir = opendir(psu_root);
+	if (!dir)
+		return "none";
+	const char *state = "none";
+	struct dirent *e;
+	while ((e = readdir(dir))) {
+		if (e->d_name[0] == '.')
+			continue;
+		char dev[PATH_MAX], type[32] = "", scope[32] = "";
+		snprintf(dev, sizeof dev, "%s/%s", psu_root, e->d_name);
+		read_word(dev, "type", type, sizeof type);
+		read_word(dev, "scope", scope, sizeof scope);
+		if (!strcmp(type, "Battery") && strcmp(scope, "Device"))
+			state = "present";
+	}
+	closedir(dir);
+	return state;
+}
+
 /* ---- stage-1 init ----------------------------------------------------------------------- */
 
 static void say(const char *fmt, const char *arg)
@@ -411,10 +451,13 @@ static int stage1(void)
 	/* ro.boot.* keep their first value: a stack forced in /gbos/cmdline (tests) wins. */
 	if (!strstr(base, "androidboot.gbos.gpu="))
 		snprintf(gpu, sizeof gpu, " androidboot.gbos.gpu=%s", gpu_stack("/sys/bus/pci/devices"));
+	char battery[64] = "";
+	if (!strstr(base, "androidboot.gbos.battery="))
+		snprintf(battery, sizeof battery, " androidboot.gbos.battery=%s", battery_state("/sys/class/power_supply"));
 	snprintf(cmdline, sizeof cmdline,
-		 "%s%s androidboot.slot_suffix=%s androidboot.boot_devices=%s androidboot.vbmeta.size=%u "
+		 "%s%s%s androidboot.slot_suffix=%s androidboot.boot_devices=%s androidboot.vbmeta.size=%u "
 		 "androidboot.vbmeta.hash_alg=sha256 androidboot.vbmeta.digest=%s",
-		 base, gpu, p.slot, bootdev, p.vbmeta_size, p.digest);
+		 base, gpu, battery, p.slot, bootdev, p.vbmeta_size, p.digest);
 	say("booting slot %s", p.slot);
 
 	int kernel = open("/gbos/kernel", O_RDONLY | O_CLOEXEC);
@@ -438,6 +481,10 @@ int main(int argc, char **argv)
 		if (d.fd < 0 || read_gpt(&d) || make_plan(&d, write_back, &p))
 			return 1;
 		printf("SLOT=%s\nVBMETA_SIZE=%u\nVBMETA_DIGEST=%s\n", p.slot, p.vbmeta_size, p.digest);
+		return 0;
+	}
+	if (argc == 3 && !strcmp(argv[1], "--battery")) {
+		puts(battery_state(argv[2]));
 		return 0;
 	}
 	if (argc == 3 && !strcmp(argv[1], "--gpu")) {

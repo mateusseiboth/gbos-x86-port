@@ -118,13 +118,18 @@ class GraphicsTest(unittest.TestCase):
             self.assertIn(line + "\n", prop)
         self.assertNotIn("skiagl", prop)
 
-    def test_amd_and_unknown_gpus_render_in_software(self):
-        # ANGLE (in /system) on SwiftShader Vulkan (vulkan.pastel.so, from Cuttlefish).
-        for stack in ("amd", "swiftshader"):
-            prop = self.prop(stack)
-            for line in ("ro.hardware.egl=angle", "ro.hardware.vulkan=pastel", "ro.gfx.angle.supported=true",
-                         "debug.hwui.renderer=skiagl", "debug.renderengine.backend=skiaglthreaded"):
-                self.assertIn(line + "\n", prop)
+    def test_amd_renders_on_the_gpu_with_radv_under_angle(self):
+        # RADV (graphics/build_radv.sh) as the Vulkan HAL; ANGLE (in /system) gives GLES on top of it.
+        prop = self.prop("amd")
+        for line in ("ro.hardware.egl=angle", "ro.hardware.vulkan=radv", "ro.gfx.angle.supported=true",
+                     "debug.hwui.renderer=skiagl", "debug.renderengine.backend=skiaglthreaded"):
+            self.assertIn(line + "\n", prop)
+
+    def test_unknown_gpus_render_in_software(self):
+        # ANGLE on SwiftShader Vulkan (vulkan.pastel.so, from Cuttlefish): the last resort.
+        prop = self.prop("swiftshader")
+        for line in ("ro.hardware.egl=angle", "ro.hardware.vulkan=pastel"):
+            self.assertIn(line + "\n", prop)
 
     def test_intel_keeps_the_stock_drivers(self):
         self.assertNotIn("ro.hardware.egl", self.prop("intel"))
@@ -171,11 +176,17 @@ class VmOnlyTest(unittest.TestCase):
     # run_vm.sh passes androidboot.gbos.vm=1; on a real PC (the pendrive) none of this may run: a fake
     # battery, no suspend and a tablet bridge only make sense in QEMU.
     def test_power_tweaks_run_only_in_the_vm(self):
-        for trigger in (b"on early-boot && property:ro.boot.gbos.vm=1\n", b"on boot && property:ro.boot.gbos.vm=1\n",
+        for trigger in (b"on boot && property:ro.boot.gbos.vm=1\n",
                         b"on property:sys.boot_completed=1 && property:ro.boot.gbos.vm=1\n"):
             self.assertIn(trigger, VM_POWER_RC)
-        self.assertNotIn(b"\non early-boot\n", VM_POWER_RC)
         self.assertNotIn(b"\non boot\n", VM_POWER_RC)
+
+    def test_the_fake_battery_loads_wherever_there_is_no_battery(self):
+        # The VM and desktops (usb/gbos_boot.c sets androidboot.gbos.battery=none); never on a laptop.
+        self.assertIn(b"on early-boot && property:ro.boot.gbos.battery=none\n"
+                      b"    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -d /vendor/lib64/modules test_power\n"
+                      .replace(b"lib64/modules", b"lib/modules"), VM_POWER_RC)
+        self.assertNotIn(b"\non early-boot\n", VM_POWER_RC)
 
     def test_vm_mouse_starts_only_in_the_vm(self):
         self.assertIn(b"service vm-mouse /vendor/bin/vm-mouse\n", VM_MOUSE_RC)

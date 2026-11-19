@@ -70,7 +70,7 @@ boot_once() {
   local shared
   shared="$(sed 's/#.*//' "$HERE/boot/cmdline.txt" | tr -s ' \n' ' ')"
   local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 console_msg_format=syslog \
-$shared loglevel=${GBOS_LOGLEVEL:-4} androidboot.gbos.vm=1 androidboot.gbos.gpu=$GPU_STACK androidboot.slot_suffix=$SLOT androidboot.boot_devices=pci0000:00/0000:00:04.0 \
+$shared loglevel=${GBOS_LOGLEVEL:-4} androidboot.gbos.vm=1 androidboot.gbos.battery=none androidboot.gbos.gpu=$GPU_STACK androidboot.slot_suffix=$SLOT androidboot.boot_devices=pci0000:00/0000:00:04.0 \
 androidboot.vbmeta.size=$VBMETA_SIZE androidboot.vbmeta.hash_alg=sha256 androidboot.vbmeta.digest=$VBMETA_DIGEST"
   # shellcheck disable=SC2086
   systemd-run --user --scope -q -p MemoryMax="$GBOS_HOST_MEM_MAX" -p MemorySwapMax=0 -p CPUQuota=$(( GBOS_SMP * 100 ))% \
