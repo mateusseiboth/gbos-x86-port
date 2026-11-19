@@ -305,19 +305,8 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
     return files
 
 
-# Render apps (HWUI) and SurfaceFlinger with Vulkan through Venus (vulkan.virtio.so -> the host's Vulkan
-# driver) instead of GL over virgl, which the security port picked.
-VULKAN_PROPS = {
-    'debug.hwui.renderer': 'skiavk',
-    'ro.hwui.use_vulkan': 'true',
-    'debug.renderengine.backend': 'skiavkthreaded',
-    'debug.renderengine.vulkan': 'true',
-    'ro.hardware.vulkan': 'virtio',
-}
-
-
 def odm_files(overrides: dict, contexts: list):
-    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'}, **VULKAN_PROPS)
+    prop = dict(overrides, **{'ro.dalvik.vm.native.bridge': '0'})
     return {
         'etc/build.prop': (odm_build_prop(prop).encode(), 'vendor_configs_file', 0o644, 0, 0),
         'etc/selinux/odm_file_contexts': (''.join(l + '\n' for l in contexts).encode(), 'vendor_configs_file', 0o644, 0, 0),

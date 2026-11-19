@@ -88,14 +88,12 @@ class VmPowerTest(unittest.TestCase):
 
 
 class GraphicsTest(unittest.TestCase):
-    def test_apps_and_surfaceflinger_render_with_vulkan_through_venus(self):
-        # The security port renders with GL over virgl; Venus passes Vulkan to the host GPU instead.
+    def test_rendering_stays_on_gl_over_virgl(self):
+        # Vulkan through the port's Venus driver crashed SurfaceFlinger in
+        # vkGetAndroidHardwareBufferPropertiesANDROID (gralloc buffers) and the guest boot-looped.
         prop = odm_files({"debug.hwui.renderer": "skiagl", "ro.hwui.use_vulkan": "false"}, [])["etc/build.prop"][0]
-        for line in (b"debug.hwui.renderer=skiavk", b"ro.hwui.use_vulkan=true",
-                     b"debug.renderengine.backend=skiavkthreaded", b"debug.renderengine.vulkan=true",
-                     b"ro.hardware.vulkan=virtio"):
-            self.assertIn(line + b"\n", prop)
-        self.assertNotIn(b"skiagl", prop)
+        self.assertIn(b"debug.hwui.renderer=skiagl\n", prop)
+        self.assertNotIn(b"skiavk", prop)
 
 
 class PointerTest(unittest.TestCase):

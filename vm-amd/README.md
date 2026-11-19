@@ -117,8 +117,9 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   `/odm/etc/build.prop` (loaded after `/vendor/build.prop`), `vendor_file_contexts` additions (device
   labels: `/dev/ttyS0`, the virtio-gpu sysfs node) -> `/odm/etc/selinux/odm_file_contexts`.
 * `ro.dalvik.vm.native.bridge=0` (libhoudini makes zygote abort silently).
-* Vulkan rendering: HWUI (`skiavk`) and SurfaceFlinger (`skiavkthreaded`) use Vulkan through Venus
-  (`vulkan.virtio.so` -> the host's Vulkan driver) instead of the security port's GL over virgl.
+* Rendering stays on GL over virgl (the security port's choice). Vulkan through its Venus driver
+  crashes SurfaceFlinger in `vkGetAndroidHardwareBufferPropertiesANDROID` (gralloc buffers) and the
+  guest boot-loops.
 * Baseline `libz.so` for `/vendor/lib64`, and for `/system/lib64` through a bind mount at `early-init`:
   `/system` cannot be overlaid on a user build (fs_mgr allowlist).
 * Boot animation: the stock one fades to black after ~5 s (enough for a real Googlebook); the layer's
