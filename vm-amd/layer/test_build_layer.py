@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_layer import (FAKE_BATTERY_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
+from build_layer import (FAKE_BATTERY_RC, SYSTEM_TWEAKS_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
                          new_dir_meta, odm_build_prop, parse_erofs_ls, prop_overrides, tree_entries, write_tar)
 
 
@@ -73,6 +73,13 @@ class FakeBatteryTriggerTest(unittest.TestCase):
         self.assertIn(b"on property:init.svc.zygote=running\n    start vm-fake-battery\n", FAKE_BATTERY_RC)
         self.assertNotIn(b"sys.boot_completed", FAKE_BATTERY_RC)
 
+
+
+class SystemTweaksTest(unittest.TestCase):
+    def test_boot_animation_is_bound_over_the_stock_one_at_early_init(self):
+        early_init = SYSTEM_TWEAKS_RC.split(b"on early-init\n")[1].split(b"\non ")[0]
+        self.assertIn(b"mount none /vendor/etc/gbos/system/media/bootanimation.zip "
+                      b"/system/media/bootanimation.zip bind", early_init)
 
 
 class TreeEntriesTest(unittest.TestCase):

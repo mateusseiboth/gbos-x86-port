@@ -201,6 +201,15 @@ def read_kernel_exports(symvers):
     return exports
 
 
+# Modules of ours that are never shipped. Hardware watchdogs: nothing in this Android
+# feeds one, and a driver taking over a timer the firmware left running resets the machine.
+EXCLUDED_PATHS = ('/drivers/watchdog/', '/drivers/char/ipmi/ipmi_watchdog.ko')
+
+
+def is_excluded(path):
+    return any(d in path for d in EXCLUDED_PATHS)
+
+
 def find_modules(root):
     """*.ko below root without following symlinks (lib/modules/<ver>/build points at the build tree)."""
     return [os.path.join(d, f) for d, _, files in os.walk(root) for f in files if f.endswith('.ko')]
@@ -214,7 +223,7 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--vendor-out', help='also write the combined /vendor/lib/modules tree')
     a = ap.parse_args()
-    ours = find_modules(a.ours)
+    ours = [f for f in find_modules(a.ours) if not is_excluded(f)]
     google = [f for d in a.google for f in find_modules(d)]
     mods = [read_module(f, 'ours') for f in ours] + [read_module(f, 'google') for f in google]
     kernel = read_kernel_exports(a.symvers)

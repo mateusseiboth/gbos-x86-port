@@ -1,6 +1,6 @@
 import unittest
 
-from resolve_modules import Module, build_modules_dep, device_path, filter_module_lines, resolve
+from resolve_modules import Module, build_modules_dep, device_path, filter_module_lines, is_excluded, resolve
 
 
 def mod(name, side, exports=None, needs=None):
@@ -141,6 +141,18 @@ class VendorModulesTest(unittest.TestCase):
         self.assertEqual(device_path("/w/shipped-dlkm/system_dlkm_a/lib/modules/y.ko"),
                          "/system/lib/modules/y.ko")
         self.assertIsNone(device_path("/w/shipped-ko/initrd/lib/modules/z.ko"))
+
+
+class ExcludedModulesTest(unittest.TestCase):
+    def test_hardware_watchdogs_are_left_out(self):
+        # Nothing in this Android feeds a hardware watchdog: once iTCO_wdt / sp5100_tco takes over a
+        # timer the firmware left running, the machine resets (QEMU's ICH9 TCO did, ~3 min into boot).
+        self.assertTrue(is_excluded("/s/lib/modules/6.18/kernel/drivers/watchdog/iTCO_wdt.ko"))
+        self.assertTrue(is_excluded("/s/lib/modules/6.18/kernel/drivers/watchdog/sp5100_tco.ko"))
+        self.assertTrue(is_excluded("/s/lib/modules/6.18/kernel/drivers/char/ipmi/ipmi_watchdog.ko"))
+
+    def test_other_drivers_are_kept(self):
+        self.assertFalse(is_excluded("/s/lib/modules/6.18/kernel/drivers/mfd/lpc_ich.ko"))
 
 
 if __name__ == "__main__":

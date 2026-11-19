@@ -31,6 +31,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from bootanimation import build_bootanimation
+
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get('GBOS_ROOT', '/mnt/dados/gbos'))
 LINUX_DIR = Path(os.environ.get('GBOS_LINUX_DIR', ROOT / 'gbos-vm-linux'))
@@ -51,11 +53,17 @@ PARTITION_NAME = 'gbos_layer'
 PORT_EDITS = {'build.prop', 'etc/selinux/vendor_file_contexts'}
 
 SYSTEM_LIBZ = 'etc/gbos/system/lib64/libz.so'
+SYSTEM_BOOTANIMATION = 'etc/gbos/system/media/bootanimation.zip'
+# The stock animation fades to black after ~5 s; this frame (wordmark) is held until boot completes.
+BOOTANIMATION_HOLD_FRAME = 'part0/Googlebook+Gemini-Cropped-FullHeight-3x150.png'
+BOOTANIMATION_TEXT = 'Starting up. The first boot can take a few minutes.'
 
 SYSTEM_TWEAKS_RC = f'''# gbos: changes to /system without touching the partition (it cannot be overlaid on a user build).
 # The shipped libz is built with AVX-VNNI; every APK/JAR read traps into gfni_emu without this.
 on early-init
     mount none /vendor/{SYSTEM_LIBZ} /system/lib64/libz.so bind
+    # Boot animation that stays up until boot completes (layer/bootanimation.py).
+    mount none /vendor/{SYSTEM_BOOTANIMATION} /system/media/bootanimation.zip bind
 
 # ChromeOS GSC / EC daemons: no such hardware in a VM, they only crash-loop. (init.svc.* of system
 # services cannot be used as triggers from /vendor, so stop them at fixed points instead.)
@@ -116,9 +124,11 @@ ODM_SEPOLICY = b''';; gbos layer policy, compiled by init together with the stoc
 (allow gbos_pointer_bridge sysfs_gpu_202604 (dir (read open getattr search)))
 (allow gbos_pointer_bridge sysfs_gpu_202604 (file (read open getattr)))
 (allow gbos_pointer_bridge sysfs_gpu_202604 (lnk_file (read getattr)))
-;; SYSTEM_TWEAKS_RC: bind the baseline libz over /system/lib64/libz.so.
+;; SYSTEM_TWEAKS_RC: bind the baseline libz and the boot animation over their /system files.
 (allow vendor_init_202604 system_lib_file_202604 (file (mounton getattr)))
 (allow init_202604 system_lib_file_202604 (file (mounton getattr)))
+(allow vendor_init_202604 system_file_202604 (file (mounton getattr)))
+(allow init_202604 system_file_202604 (file (mounton getattr)))
 '''
 
 # Any file here makes init skip the vendor precompiled policy (its .sha256 sidecars are missing)
@@ -281,9 +291,13 @@ def driver_files(stock_vendor: Path):
 
 
 def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
+    _, _, port = _helpers()
     files = {
         'lib64/libz.so': _entry(stock_vendor, 'lib64/libz.so', LIBZ.read_bytes()),
         SYSTEM_LIBZ: _entry(stock_system, 'system/lib64/libz.so', LIBZ.read_bytes()),
+        SYSTEM_BOOTANIMATION: _entry(stock_system, 'system/media/bootanimation.zip', build_bootanimation(
+            port.dump_cat(stock_system, '/system/media/bootanimation.zip'), BOOTANIMATION_HOLD_FRAME,
+            BOOTANIMATION_TEXT)),
         'etc/init/gbos-system-tweaks.rc': (SYSTEM_TWEAKS_RC, 'vendor_configs_file', 0o644, 0, 0),
         'etc/init/vm-fake-battery.rc': (FAKE_BATTERY_RC, 'vendor_configs_file', 0o644, 0, 0),
         'etc/init/vm-pointer-bridge.rc': (POINTER_BRIDGE_RC, 'vendor_configs_file', 0o644, 0, 0),

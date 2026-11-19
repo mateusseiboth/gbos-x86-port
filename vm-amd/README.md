@@ -48,6 +48,8 @@ SELinux failures.
 | `layer/build_layer.py` | builds `vm/layer.img` |
 | `boot/slot.py` | A/B selection from `misc` + vbmeta size/digest of the chosen slot |
 | `boot/initrd.py` | adds the layer to the ramdisk's first-stage fstab |
+| `boot/progress.py` | prints the boot phases from the serial log while QEMU runs |
+| `layer/bootanimation.py` | the stock boot animation plus a held frame that loops until boot completes |
 | `run_vm.sh` | launcher |
 
 Tests: `python3 -m unittest` in `kernel/`, `layer/` and `boot/`.
@@ -61,6 +63,11 @@ GBOS_NET_ARGS="-nic none" vm-amd/run_vm.sh         # offline
 GBOS_DISPLAY_ARGS="-display egl-headless -vnc 127.0.0.1:7" vm-amd/run_vm.sh
 python3 host/vnc.py shot out.png --port 5907       # headless screenshot
 ```
+
+The terminal shows the boot phases as the serial log reaches them (`boot/progress.py`): kernel
+started, Android userspace running, boot animation on screen, boot completed. The window is black for
+the first ~20 s (Google's virtio-gpu module sets up no framebuffer console), then shows the boot
+animation until Android is ready.
 
 `GBOS_MEM` (guest RAM, 4G), `GBOS_HOST_MEM_MAX` (cgroup cap, 7G), `GBOS_LOGLEVEL` (7 shows gfni_emu
 counters), `GBOS_ONCE=1` (no relaunch after a guest reboot), `GBOS_WACOM=1` (old Wacom tablet instead of
@@ -109,6 +116,9 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
 * `ro.dalvik.vm.native.bridge=0` (libhoudini makes zygote abort silently).
 * Baseline `libz.so` for `/vendor/lib64`, and for `/system/lib64` through a bind mount at `early-init`:
   `/system` cannot be overlaid on a user build (fs_mgr allowlist).
+* Boot animation: the stock one fades to black after ~5 s (enough for a real Googlebook); the layer's
+  copy keeps playing it, then holds the wordmark with "Starting up. The first boot can take a few
+  minutes." until boot completes. Bound over `/system/media/bootanimation.zip` at `early-init`.
 * `gscd` / `timberslide` stopped at `boot` (ChromeOS GSC / EC daemons that crash-loop in a VM).
 * Fake AC / 100 % battery, applied as soon as zygote is up (the setup wizard checks it before
   `boot_completed`) and again whenever zygote restarts.
@@ -118,7 +128,7 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
 * `vm-pointer-bridge` (usb-tablet -> clickable pointer + wheel) in its own SELinux domain.
 * **Drivers**: a `/vendor/lib/modules` directory in place of the stock symlink to
   `/vendor_dlkm/lib/modules`. ueventd (modalias handling), `init.insmod.sh` and the vendor rc files all
-  read that path, so its index decides per name: our 3351 modules are files there, Google's 564 are named
+  read that path, so its index decides per name: our 3316 modules are files there, Google's 564 are named
   by their real path (`/vendor_dlkm/lib/modules/x.ko`, `/system/lib/modules/x.ko`; libmodprobe opens
   modules with `O_NOFOLLOW`, so links do not work). `modules.load` / `.blocklist` / `.options` are
   Google's. `.ko` files are labeled `vendor_kernel_modules`, which the stock policy already lets
@@ -163,6 +173,10 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   and, with `--vendor-out`, the layer's `/vendor/lib/modules`. That index is built from the vendor_dlkm
   the layer was made for: after an OTA that changes Google's module set, rerun the resolver and
   `build_layer.py` (an unchanged set keeps working, since the index names files, not contents).
+* **No hardware watchdog drivers** (`drivers/watchdog/`, `ipmi_watchdog`): nothing in this Android
+  feeds one. With `iTCO_wdt` loaded, QEMU's ICH9 TCO timer fired ~3 min into boot and reset the guest,
+  which `-no-reboot` turned into QEMU closing without a message. A real PC (`iTCO_wdt`, `sp5100_tco`)
+  would reboot the same way.
 * Modules load only after switch_root (ueventd). Storage/USB controllers that must exist before that
   (`ahci`, NVMe is built in) work in the VM because the disk is NVMe; a real-PC image needs them in the
   first-stage ramdisk.

@@ -43,7 +43,8 @@ TABLET=usb-tablet; [ "${GBOS_WACOM:-0}" = 1 ] && TABLET=usb-wacom-tablet
 boot_once() {
   eval "$(python3 "$HERE/boot/slot.py" boot-args "$OVERLAY" "$BASE")"
   mkdir -p "$LOG"
-  echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes)" >&2
+  [ -f "$LOG/serial.log" ] && mv -f "$LOG/serial.log" "$LOG/serial.log.prev"
+  echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes); the window stays black for ~20 s, then the boot animation" >&2
   # cfi=norand: gfni_emu's entry stubs carry fixed kCFI hashes. overlay.gbos_caller_creds: the layer is
   # mounted before any SELinux policy exists (see the kernel patch).
   local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 panic=0 root=/dev/ram0 \
@@ -65,7 +66,11 @@ androidboot.dalvik.vm.enable_uffd_gc=true androidboot.zygote.disable_gl_preload"
     -device nvme,id=nvme0,serial=gb0,addr=0x4 \
     -device nvme-ns,drive=disk,bus=nvme0,nsid=1 -device nvme-ns,drive=layer,bus=nvme0,nsid=2 \
     $GBOS_GPU_ARGS $GBOS_INPUT_ARGS $GBOS_NET_ARGS $GBOS_DISPLAY_ARGS \
-    -serial file:"$LOG/serial.log" -monitor none || true
+    -serial file:"$LOG/serial.log" -monitor none &
+  local qemu=$!
+  python3 "$HERE/boot/progress.py" "$LOG/serial.log" "$qemu" &
+  wait "$qemu" || true
+  wait
 }
 
 # -no-reboot turns a guest reboot into an exit; relaunch on "Restarting system" (an OTA, a crash
