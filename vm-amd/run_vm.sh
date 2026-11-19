@@ -45,6 +45,8 @@ boot_once() {
   mkdir -p "$LOG"
   [ -f "$LOG/serial.log" ] && mv -f "$LOG/serial.log" "$LOG/serial.log.prev"
   echo "booting slot $SLOT (vbmeta $VBMETA_SIZE bytes); the window stays black for ~20 s, then the boot animation" >&2
+  # i8042=off: with Fedora's psmouse loaded, the guest enables the PS/2 mouse and QEMU then sends the
+  # pointer there instead of to usb-tablet (the pointer bridge saw no events, clicks did nothing).
   # cfi=norand: gfni_emu's entry stubs carry fixed kCFI hashes. overlay.gbos_caller_creds: the layer is
   # mounted before any SELinux policy exists (see the kernel patch).
   local cmd="console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 panic=0 root=/dev/ram0 \
@@ -59,7 +61,7 @@ androidboot.vendor.boot_patchlevel=2026-09-01 androidboot.boot_patchlevel=2026-0
 androidboot.dalvik.vm.enable_uffd_gc=true androidboot.zygote.disable_gl_preload"
   # shellcheck disable=SC2086
   systemd-run --user --scope -q -p MemoryMax="${GBOS_HOST_MEM_MAX:-7G}" -p MemorySwapMax=0 -p CPUQuota=400% \
-    timeout "${GBOS_SECS:-28800}" qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m "${GBOS_MEM:-4G}" -machine q35 \
+    timeout "${GBOS_SECS:-28800}" qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m "${GBOS_MEM:-4G}" -machine q35,i8042=off \
     -nodefaults -no-reboot -kernel "$KERNEL" -initrd "$INITRD" -append "$cmd" \
     -drive if=none,id=disk,format=qcow2,file="$OVERLAY" \
     -drive if=none,id=layer,format=raw,readonly=on,file="$LAYER" \

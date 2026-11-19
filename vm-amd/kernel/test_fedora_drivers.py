@@ -137,6 +137,16 @@ class ProtectedCoreTest(unittest.TestCase):
         self.assertEqual(lines, [])
 
 
+class VmExtrasTest(unittest.TestCase):
+    def test_the_vm_battery_module_is_always_built(self):
+        # test_power: battery + AC power supplies the health HAL reads (QEMU has no ACPI battery).
+        symbols = {"TEST_POWER": ("tristate", "drivers/power/supply/Kconfig")}
+        self.assertEqual(build_fragment({}, {}, symbols), ["CONFIG_TEST_POWER=m"])
+
+    def test_extras_unknown_to_the_tree_are_skipped(self):
+        self.assertEqual(build_fragment({}, {}, {}), [])
+
+
 class CoreDriftTest(unittest.TestCase):
     def test_reports_gki_options_that_changed(self):
         self.assertEqual(core_drift({"DRM": "y", "X": "n"}, {"DRM": "m", "X": "n"}, set()), {"DRM": ("y", "m")})

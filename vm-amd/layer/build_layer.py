@@ -15,6 +15,7 @@ Inputs (env, defaults under GBOS_ROOT):
   GBOS_LIBZ          baseline libz.so (vm-amd/zlib-build)
   GBOS_POINTER_BRIDGE  pointer-bridge/vm-pointer-bridge
   GBOS_FUTILITY_STUB   layer/stubs/out/futility (layer/stubs/build.sh)
+  GBOS_GSCUTIL_STUB    layer/stubs/out/gscutil (layer/stubs/build.sh)
   GBOS_VENDOR_MODULES  combined /vendor/lib/modules (kernel/resolve_modules.py --vendor-out)
   GBOS_FIRMWARE        firmware tree (kernel/collect_firmware.py), added under /vendor/firmware
 """
@@ -41,6 +42,7 @@ PORT_IMAGE = Path(os.environ.get('GBOS_PORT_IMAGE', LINUX_DIR / 'image-security/
 LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
 POINTER_BRIDGE = Path(os.environ.get('GBOS_POINTER_BRIDGE', HERE.parents[1] / 'pointer-bridge/vm-pointer-bridge'))
 FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futility'))
+GSCUTIL_STUB = Path(os.environ.get('GBOS_GSCUTIL_STUB', HERE / 'stubs/out/gscutil'))
 VENDOR_MODULES = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
 FIRMWARE = Path(os.environ.get('GBOS_FIRMWARE', ROOT / 'dlkm/firmware'))
 SUPER_BASE = 1458176 * 512
@@ -54,6 +56,8 @@ PORT_EDITS = {'build.prop', 'etc/selinux/vendor_file_contexts'}
 
 SYSTEM_LIBZ = 'etc/gbos/system/lib64/libz.so'
 SYSTEM_BOOTANIMATION = 'etc/gbos/system/media/bootanimation.zip'
+SYSTEM_GSCUTIL = 'etc/gbos/system/bin/gscutil'
+SYSTEM_GSCUTIL_REAL = 'etc/gbos/system/bin/gscutil.real'
 # The stock animation fades to black after ~5 s; this frame (wordmark) is held until boot completes.
 BOOTANIMATION_HOLD_FRAME = 'part0/Googlebook+Gemini-Cropped-FullHeight-3x150.png'
 BOOTANIMATION_TEXT = 'Starting up. The first boot can take a few minutes.'
@@ -64,6 +68,13 @@ on early-init
     mount none /vendor/{SYSTEM_LIBZ} /system/lib64/libz.so bind
     # Boot animation that stays up until boot completes (layer/bootanimation.py).
     mount none /vendor/{SYSTEM_BOOTANIMATION} /system/media/bootanimation.zip bind
+    # No GSC: its firmware update fails the OTA postinstall (layer/stubs/gscutil.c). Keep the real
+    # gscutil reachable for the wrapper, then put the wrapper in its place.
+    mount none /system/bin/gscutil /vendor/{SYSTEM_GSCUTIL_REAL} bind
+    # /system is shared: a peer of it would receive the next mount too, and the wrapper would
+    # end up exec'ing itself.
+    mount none none /vendor/{SYSTEM_GSCUTIL_REAL} private
+    mount none /vendor/{SYSTEM_GSCUTIL} /system/bin/gscutil bind
 
 # ChromeOS GSC / EC daemons: no such hardware in a VM, they only crash-loop. (init.svc.* of system
 # services cannot be used as triggers from /vendor, so stop them at fixed points instead.)
@@ -75,20 +86,28 @@ on property:sys.boot_completed=1
     stop timberslide
 '''.encode()
 
-FAKE_BATTERY_RC = (
-    b'# gbos: no ChromeOS EC in a VM, so the battery reads 0% and setup refuses to continue.\n'
-    b'# The fake values live in system_server; re-apply them whenever zygote comes back (and before\n'
-    b'# boot_completed: the setup wizard checks the battery early). The loop waits for BatteryService.\n'
-    b'service vm-fake-battery /system/bin/sh -c "for i in $$(seq 1 60); do cmd battery set ac 1 && break; sleep 5; done; '
-    b'cmd battery set usb 0; cmd battery set status 2; cmd battery set level 100; svc power stayon true"\n'
+# gbos: power in a VM. QEMU has no battery and the ChromeOS EC is missing, so the battery read 0 %
+# and setup refused to go on; test_power (kernel/fedora_drivers.py VM_EXTRAS) gives the health HAL
+# a full battery on AC through /sys/class/power_supply. The guest never suspends (s2idle left the
+# window blank mid-update) and the screen stays on while "plugged in".
+TEST_POWER_OPTIONS = 'options test_power ac_online=on battery_status=full battery_capacity=100\n'
+
+VM_POWER_RC = (
+    b'on early-boot\n'
+    b'    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -d /vendor/lib/modules test_power\n\n'
+    b'on boot\n'
+    b'    write /sys/power/wake_lock gbos_vm\n\n'
+    b'service vm-stay-awake /system/bin/sh -c "for i in $$(seq 1 60); do '
+    b'cmd settings put global stay_on_while_plugged_in 7 && break; sleep 5; done; '
+    b'cmd settings put system screen_off_timeout 2147483647"\n'
     b'    class late_start\n'
     b'    user shell\n'
     b'    group shell\n'
     b'    seclabel u:r:shell:s0\n'
     b'    oneshot\n'
     b'    disabled\n\n'
-    b'on property:init.svc.zygote=running\n'
-    b'    start vm-fake-battery\n'
+    b'on property:sys.boot_completed=1\n'
+    b'    start vm-stay-awake\n'
 )
 
 POINTER_BRIDGE_RC = (
@@ -124,6 +143,15 @@ ODM_SEPOLICY = b''';; gbos layer policy, compiled by init together with the stoc
 (allow gbos_pointer_bridge sysfs_gpu_202604 (dir (read open getattr search)))
 (allow gbos_pointer_bridge sysfs_gpu_202604 (file (read open getattr)))
 (allow gbos_pointer_bridge sysfs_gpu_202604 (lnk_file (read getattr)))
+;; SYSTEM_TWEAKS_RC: the gscutil wrapper (system_ext types) runs the real gscutil kept under /vendor.
+(allow vendor_init_202604 gscutil_exec (file (mounton getattr)))
+(allow init_202604 gscutil_exec (file (mounton getattr)))
+(allow gscutil gscutil_exec (file (read getattr map execute open execute_no_trans)))
+(allow gscutil vendor_file_202604 (dir (search getattr)))
+(allow gscutil vendor_configs_file_202604 (dir (search getattr)))
+;; VM_POWER_RC: hold a kernel wake lock so the guest never suspends.
+(allow vendor_init_202604 sysfs_wake_lock_202604 (file (open write getattr)))
+(allow vendor_init_202604 self (capability2 (block_suspend)))
 ;; SYSTEM_TWEAKS_RC: bind the baseline libz and the boot animation over their /system files.
 (allow vendor_init_202604 system_lib_file_202604 (file (mounton getattr)))
 (allow init_202604 system_lib_file_202604 (file (mounton getattr)))
@@ -284,6 +312,8 @@ def driver_files(stock_vendor: Path):
     """Fedora-driver modules (in place of the /vendor/lib/modules symlink) and the firmware the
     stock vendor does not already ship."""
     modules = {f'lib/modules/{k}': v for k, v in tree_entries(VENDOR_MODULES, module_label).items()}
+    options = (VENDOR_MODULES / 'modules.options').read_text() + TEST_POWER_OPTIONS
+    modules['lib/modules/modules.options'] = (options.encode(), 'vendor_file', 0o644, 0, 0)
     stock = stock_tree(stock_vendor, 'firmware')
     firmware = {f'firmware/{k}': v for k, v in tree_entries(FIRMWARE, firmware_label, skip={'MISSING.txt'}).items()
                 if f'firmware/{k}' not in stock}
@@ -299,11 +329,13 @@ def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
             port.dump_cat(stock_system, '/system/media/bootanimation.zip'), BOOTANIMATION_HOLD_FRAME,
             BOOTANIMATION_TEXT)),
         'etc/init/gbos-system-tweaks.rc': (SYSTEM_TWEAKS_RC, 'vendor_configs_file', 0o644, 0, 0),
-        'etc/init/vm-fake-battery.rc': (FAKE_BATTERY_RC, 'vendor_configs_file', 0o644, 0, 0),
+        'etc/init/vm-power.rc': (VM_POWER_RC, 'vendor_configs_file', 0o644, 0, 0),
         'etc/init/vm-pointer-bridge.rc': (POINTER_BRIDGE_RC, 'vendor_configs_file', 0o644, 0, 0),
         'bin/vm-pointer-bridge': (POINTER_BRIDGE.read_bytes(), 'gbos_pointer_bridge_exec', 0o755, 0, 2000),
         # OTA postinstall flashes the AP firmware through futility; there is none (stubs/futility.c).
         'bin/futility': _entry(stock_vendor, 'bin/futility', FUTILITY_STUB.read_bytes()),
+        SYSTEM_GSCUTIL: _entry(stock_system, 'system/bin/gscutil', GSCUTIL_STUB.read_bytes()),
+        SYSTEM_GSCUTIL_REAL: _entry(stock_system, 'system/bin/gscutil', b''),  # mount point
     }
     return files
 
@@ -403,7 +435,8 @@ def build_disk(erofs: Path, disk: Path):
 
 def main():
     out = Path(sys.argv[1])
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE, FUTILITY_STUB, VENDOR_MODULES, FIRMWARE):
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE, FUTILITY_STUB, GSCUTIL_STUB, VENDOR_MODULES,
+                 FIRMWARE):
         if not need.exists():
             raise SystemExit(f'missing {need}')
     tmp = Path(tempfile.mkdtemp(prefix='gbos-layer-', dir=out.parent))

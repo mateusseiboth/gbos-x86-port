@@ -167,6 +167,11 @@ def _touches_core(name, selects, protected):
     return name in protected or bool(selects_closure(name, selects) & protected)
 
 
+# Built whatever Fedora does. TEST_POWER: battery + AC power supplies for the VM (QEMU has no ACPI
+# battery and the health HAL reads /sys/class/power_supply).
+VM_EXTRAS = {'TEST_POWER': 'm'}
+
+
 def build_fragment(fedora, ours, symbols, selects=None, protected=frozenset()):
     selects = selects or {}
     lines = []
@@ -180,6 +185,7 @@ def build_fragment(fedora, ours, symbols, selects=None, protected=frozenset()):
     # Pin the protected options GKI leaves off, so no `default y if ...` turns them on.
     lines += [f'# CONFIG_{name} is not set' for name in sorted(protected)
               if name in symbols and ours.get(name, 'n') == 'n']
+    lines += [f'CONFIG_{name}={value}' for name, value in sorted(VM_EXTRAS.items()) if name in symbols]
     return lines
 
 

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_layer import (FAKE_BATTERY_RC, SYSTEM_TWEAKS_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
+from build_layer import (ODM_SEPOLICY, SYSTEM_TWEAKS_RC, TEST_POWER_OPTIONS, VM_POWER_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
                          new_dir_meta, odm_build_prop, parse_erofs_ls, prop_overrides, tree_entries, write_tar)
 
 
@@ -66,13 +66,25 @@ class AddedLinesTest(unittest.TestCase):
         self.assertEqual(added_lines("a\n", "a\n\n# note\n"), [])
 
 
-class FakeBatteryTriggerTest(unittest.TestCase):
-    def test_starts_as_soon_as_zygote_runs(self):
-        # The setup wizard checks the battery before boot_completed; the service itself retries
-        # `cmd battery` until BatteryService answers.
-        self.assertIn(b"on property:init.svc.zygote=running\n    start vm-fake-battery\n", FAKE_BATTERY_RC)
-        self.assertNotIn(b"sys.boot_completed", FAKE_BATTERY_RC)
+class VmPowerTest(unittest.TestCase):
+    def test_battery_and_ac_come_from_test_power(self):
+        # The health HAL reads /sys/class/power_supply; `cmd battery set` lived only in system_server.
+        self.assertIn(b"exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -d /vendor/lib/modules test_power",
+                      VM_POWER_RC)
+        self.assertEqual(TEST_POWER_OPTIONS,
+                         "options test_power ac_online=on battery_status=full battery_capacity=100\n")
+        self.assertNotIn(b"cmd battery", VM_POWER_RC)
 
+    def test_the_guest_never_suspends(self):
+        self.assertIn(b"write /sys/power/wake_lock gbos_vm", VM_POWER_RC)
+        # Writing wake_lock needs CAP_BLOCK_SUSPEND, which vendor_init lacked (EPERM).
+        self.assertIn("(allow vendor_init_202604 self (capability2 (block_suspend)))", ODM_SEPOLICY.decode())
+
+    def test_screen_stays_on_through_settings_the_shell_may_write(self):
+        # `svc power stayon` needs WRITE_SETTINGS, which com.android.shell lacks on a user build.
+        self.assertIn(b"cmd settings put global stay_on_while_plugged_in 7", VM_POWER_RC)
+        self.assertIn(b"cmd settings put system screen_off_timeout 2147483647", VM_POWER_RC)
+        self.assertNotIn(b"svc power", VM_POWER_RC)
 
 
 class SystemTweaksTest(unittest.TestCase):
@@ -80,6 +92,16 @@ class SystemTweaksTest(unittest.TestCase):
         early_init = SYSTEM_TWEAKS_RC.split(b"on early-init\n")[1].split(b"\non ")[0]
         self.assertIn(b"mount none /vendor/etc/gbos/system/media/bootanimation.zip "
                       b"/system/media/bootanimation.zip bind", early_init)
+
+    def test_gscutil_is_kept_aside_then_wrapped(self):
+        early_init = SYSTEM_TWEAKS_RC.split(b"on early-init\n")[1].split(b"\non ")[0]
+        keep = b"mount none /system/bin/gscutil /vendor/etc/gbos/system/bin/gscutil.real bind"
+        # /system is a shared mount: without this the wrapper's mount propagates onto the kept copy,
+        # the wrapper then execs itself forever and init hangs on `gscutil perform-os-startup`.
+        private = b"mount none none /vendor/etc/gbos/system/bin/gscutil.real private"
+        wrap = b"mount none /vendor/etc/gbos/system/bin/gscutil /system/bin/gscutil bind"
+        self.assertLess(early_init.index(keep), early_init.index(private))
+        self.assertLess(early_init.index(private), early_init.index(wrap))
 
 
 class TreeEntriesTest(unittest.TestCase):

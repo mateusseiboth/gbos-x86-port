@@ -120,11 +120,22 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   copy keeps playing it, then holds the wordmark with "Starting up. The first boot can take a few
   minutes." until boot completes. Bound over `/system/media/bootanimation.zip` at `early-init`.
 * `gscd` / `timberslide` stopped at `boot` (ChromeOS GSC / EC daemons that crash-loop in a VM).
-* Fake AC / 100 % battery, applied as soon as zygote is up (the setup wizard checks it before
-  `boot_completed`) and again whenever zygote restarts.
+* **Power** (`vm-power.rc`): the kernel's `test_power` module (built through `fedora_drivers.py`
+  `VM_EXTRAS`, options `ac_online=on battery_status=full battery_capacity=100`) gives the health HAL a
+  full battery on AC through `/sys/class/power_supply`; the old `cmd battery set` override lived only in
+  system_server and got lost. A kernel wake lock (`gbos_vm`) keeps the guest from suspending (s2idle
+  left the window on "Display output is not active" in the middle of an update), and
+  `stay_on_while_plugged_in` / `screen_off_timeout` keep the screen on (`svc power stayon` needs
+  `WRITE_SETTINGS`, which the shell lacks on a user build).
 * `/vendor/bin/futility` replaced by a stub (`layer/stubs/futility.c`, `layer/stubs/build.sh`): the OTA
   postinstall step flashes the AP firmware with `futility update`; there is no SPI flash, and the real
   tool's failure made update_engine reject the whole update (`kPostinstallRunnerError`).
+* `/system/bin/gscutil` wrapped (`layer/stubs/gscutil.c`, bound at `early-init`): the postinstall
+  step also updates the GSC firmware (`gscutil perform-post-install`), which fails without a GSC. The
+  wrapper reports that one command as done and runs the real gscutil (kept at
+  `/vendor/etc/gbos/system/bin/gscutil.real`) for everything else. The kept copy is made a private
+  mount before the wrapper covers the original: `/system` is shared, so otherwise the wrapper's mount
+  propagated onto the copy, the wrapper exec'd itself and init hung on `gscutil perform-os-startup`.
 * `vm-pointer-bridge` (usb-tablet -> clickable pointer + wheel) in its own SELinux domain.
 * **Drivers**: a `/vendor/lib/modules` directory in place of the stock symlink to
   `/vendor_dlkm/lib/modules`. ueventd (modalias handling), `init.insmod.sh` and the vendor rc files all
@@ -177,6 +188,9 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   feeds one. With `iTCO_wdt` loaded, QEMU's ICH9 TCO timer fired ~3 min into boot and reset the guest,
   which `-no-reboot` turned into QEMU closing without a message. A real PC (`iTCO_wdt`, `sp5100_tco`)
   would reboot the same way.
+* **`-machine q35,i8042=off`**: Fedora's `psmouse` enables the Q35 PS/2 mouse, and QEMU then sends
+  the pointer to it instead of to usb-tablet: the pointer bridge got no events and clicks did nothing.
+  Real PCs keep `psmouse` (PS/2 touchpads).
 * Modules load only after switch_root (ueventd). Storage/USB controllers that must exist before that
   (`ahci`, NVMe is built in) work in the VM because the disk is NVMe; a real-PC image needs them in the
   first-stage ramdisk.
