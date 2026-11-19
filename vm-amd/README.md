@@ -45,6 +45,8 @@ SELinux failures.
 | `kernel/resolve_modules.py` | picks ours or Google's for every module name both sides ship; writes the combined `/vendor/lib/modules` |
 | `zlib-build/build.sh` | `patches/build_libz.sh` pointed at a local AOSP `external/zlib` checkout |
 | `layer/build_layer.py` | builds `vm/layer.img` (`--vulkan`: `vm/layer-vulkan.img`) |
+| `usb/` | pendrive: `gbos_boot.c` (stage-1 bootloader), `build_usb.py` (disk image) |
+| `graphics/build_radv.sh` | RADV (Mesa's AMD Vulkan driver) for Android |
 | `virgl/` | virglrenderer 1.3.0 + `external-egl-gbm.patch` for Vulkan (Venus) under QEMU; `build.sh` -> `virgl/out` |
 | `boot/slot.py` | A/B selection from `misc` + vbmeta size/digest of the chosen slot |
 | `boot/initrd.py` | adds the layer to the ramdisk's first-stage fstab |
@@ -122,6 +124,40 @@ python3 $GBOS_ROOT/tuned/layer/build_layer.py $GBOS_ROOT/vm/layer-vulkan.img --v
 $GBOS_ROOT/tuned/virgl/build.sh                                                       # for GBOS_VULKAN=1
 python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_ROOT/vm/initrd
 ```
+
+## Pendrive (real PC)
+
+```sh
+vm-amd/graphics/build_radv.sh                                   # RADV for AMD GPUs (once)
+python3 vm-amd/layer/fetch_swiftshader.py <cuttlefish-img.zip> $GBOS_ROOT/graphics/vulkan.pastel.so  # once
+python3 vm-amd/layer/build_layer.py $GBOS_ROOT/vm/layer.img
+python3 vm-amd/usb/build_usb.py $GBOS_ROOT/usb/gbos-usb.img --size $(lsblk -bdno SIZE /dev/sdX)
+sudo dd if=$GBOS_ROOT/usb/gbos-usb.img of=/dev/sdX bs=16M oflag=direct conv=fsync status=progress
+```
+
+Boot the PC from the stick (firmware boot menu) with **Secure Boot off**: nothing is signed. The first
+boot takes several minutes (Android formats userdata, compiles apps).
+
+How it boots: the firmware loads `\EFI\BOOT\BOOTX64.EFI` from the stick's own ESP, a UKI made of the
+build host's Fedora kernel and a stage-1 initramfs whose `/init` is `usb/gbos_boot.c`. Ours has no
+kexec (adding it changes the core and breaks module CRCs), Fedora's does. gbos-boot finds the disk with
+a `gbos_layer` partition, picks the A/B slot from misc (spending a try on an unverified slot, as
+`boot/slot.py` does for the VM), measures vbmeta, detects the GPU stack and whether a battery exists,
+and kexecs our kernel with the Android ramdisk and a command line made of `boot/cmdline.txt` plus
+`androidboot.slot_suffix`, `vbmeta.*`, `boot_devices` (the disk controller's PCI path),
+`androidboot.gbos.gpu` and `androidboot.gbos.battery`. `GBOS_CMDLINE_EXTRA` appends arguments for
+debugging (an `androidboot.gbos.*` given there wins over detection).
+
+Image layout (`usb/build_usb.py`): ESP (`GBOS-EFI`, 256 MiB), every stock partition except userdata in
+its original order (names, type/unique GUIDs and attributes kept; Android finds them by name), the
+layer as `gbos_layer`, userdata filling the rest (13 GiB on a 32 GB stick).
+
+Graphics stacks (`/odm/etc/gbos/gpu_<stack>.prop`, from the display controller's PCI vendor):
+`intel` keeps Google's drivers; `amd` renders on the GPU with RADV (`graphics/build_radv.sh`) under
+ANGLE, with buffers from minigbm's dumb backend (Google's minigbm has no amdgpu one, so its "radeon"
+dumb entry answers to amdgpu); `virgl`/`venus` are the VM's; anything else falls back to ANGLE on
+SwiftShader. Tested under QEMU + OVMF with the stick as a USB disk (setup wizard, GPU and battery
+detected); the RADV path needs real AMD hardware.
 
 ## What the layer contains
 
