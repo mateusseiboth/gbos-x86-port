@@ -5,6 +5,7 @@ Reproducible subset of gbos-x86-port/patches/apply_{system,vendor}_update.py, wi
 author's hand-patched binaries:
   * system_a + vendor_a: libz.so rebuilt for baseline x86-64 (no AVX-VNNI Adler-32 loop);
   * system_a: ro.dalvik.vm.native.bridge=0 (libhoudini makes zygote abort silently);
+  * vendor_a: vm-pointer-bridge (usb-tablet -> clickable pointer + wheel);
   * vendor_a: fake AC / 100% battery after boot (no ChromeOS EC in a VM, so the setup
     wizard would refuse to continue at 0%).
 
@@ -26,6 +27,7 @@ ROOT = Path(os.environ.get('GBOS_ROOT', '/mnt/dados/gbos'))
 LINUX_DIR = Path(os.environ.get('GBOS_LINUX_DIR', ROOT / 'gbos-vm-linux'))
 PORT_PATCHES = Path(os.environ.get('GBOS_PORT_PATCHES', HERE.parents[1] / 'patches'))
 LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
+POINTER_BRIDGE = Path(os.environ.get('GBOS_POINTER_BRIDGE', HERE.parents[1] / 'pointer-bridge/vm-pointer-bridge'))
 IMAGE = LINUX_DIR / 'image-security/googlebook-security.bin'
 SUPER_BASE = 1458176 * 512
 SUPER_END = 26624000 * 512
@@ -45,6 +47,18 @@ FAKE_BATTERY_RC = (
     b'    disabled\n\n'
     b'on property:sys.boot_completed=1 && property:init.svc.zygote=running\n'
     b'    start vm-fake-battery\n'
+)
+
+
+# QEMU usb-tablet -> uinput pointer + wheel (pointer-bridge/). The Wacom tablet alone is treated as a
+# stylus, so clicks are unreliable and there is no wheel.
+POINTER_BRIDGE_RC = (
+    b'# VM: usb-tablet -> uinput (pointer + wheel); the helper waits for the tablet itself\n'
+    b'service vm-pointer-bridge /vendor/bin/vm-pointer-bridge\n'
+    b'    class late_start\n'
+    b'    user root\n'
+    b'    group root input uhid\n'
+    b'    seclabel u:r:shell:s0\n'
 )
 
 
@@ -104,7 +118,11 @@ def build_system_files(fs, h):
 
 def build_vendor_files(fs, h):
     _, erofs_metadata, port, _ = h
-    files = {'etc/init/vm-fake-battery.rc': (FAKE_BATTERY_RC, 'vendor_configs_file', 0o644, 0, 0)}
+    files = {
+        'etc/init/vm-fake-battery.rc': (FAKE_BATTERY_RC, 'vendor_configs_file', 0o644, 0, 0),
+        'etc/init/vm-pointer-bridge.rc': (POINTER_BRIDGE_RC, 'vendor_configs_file', 0o644, 0, 0),
+        'bin/vm-pointer-bridge': (POINTER_BRIDGE.read_bytes(), 'vendor_file', 0o755, 0, 0),
+    }
     if not port._exists(fs, 'lib64/libz.so'):
         return files
     replace_file(files, fs, 'lib64/libz.so', LIBZ.read_bytes(), erofs_metadata.metadata, port._label)
@@ -192,6 +210,8 @@ def patch_partition(name, strategy, h):
 def patch_partitions(names=tuple(PARTITIONS)):
     if not LIBZ.exists():
         raise SystemExit(f'missing {LIBZ}: build it with vm-amd/zlib-build/build.sh')
+    if not POINTER_BRIDGE.exists():
+        raise SystemExit(f'missing {POINTER_BRIDGE}: build it with pointer-bridge/build.sh')
     h = load_helpers()
     for name in names:
         patch_partition(name, PARTITIONS[name], h)

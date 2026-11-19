@@ -33,7 +33,8 @@ ARGS="cfi=norand loglevel=${GBOS_LOGLEVEL:-4} androidboot.selinux=permissive enf
 androidboot.vendor.boot_patchlevel=2026-09-01 androidboot.boot_patchlevel=2026-09-01 \
 androidboot.dalvik.vm.enable_uffd_gc=true androidboot.zygote.disable_gl_preload"
 
-# The image has no in-guest pointer bridge, so use the Wacom tablet (4:3 keeps the pointer 1:1).
-export GBOS_WACOM=1 GBOS_KERNEL="$KERNEL" GBOS_OVERLAY="$OVERLAY"
+# usb-tablet + in-guest vm-pointer-bridge (clicks and wheel, any aspect ratio). GBOS_WACOM=1 goes back
+# to the Wacom tablet for an image patched without the bridge.
+export GBOS_WACOM="${GBOS_WACOM:-0}" GBOS_KERNEL="$KERNEL" GBOS_OVERLAY="$OVERLAY"
 exec systemd-run --user --scope -q -p MemoryMax="${GBOS_HOST_MEM_MAX:-7G}" -p MemorySwapMax=0 -p CPUQuota=400% \
   "$HERE/../host/boot_vm_overlay.sh" "$WORK" "$NAME" "${GBOS_SECS:-28800}" "$ARGS"

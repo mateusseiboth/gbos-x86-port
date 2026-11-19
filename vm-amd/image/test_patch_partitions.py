@@ -1,6 +1,6 @@
 import unittest
 
-from patch_partitions import FAKE_BATTERY_RC, disable_native_bridge, disable_service, drop_avb
+from patch_partitions import FAKE_BATTERY_RC, POINTER_BRIDGE_RC, disable_native_bridge, disable_service, drop_avb
 
 
 class DisableNativeBridgeTest(unittest.TestCase):
@@ -95,6 +95,16 @@ class FakeBatteryRcTest(unittest.TestCase):
     def test_waits_long_enough_for_a_slow_battery_service(self):
         self.assertIn(b"for i in $$(seq 1 60); do", FAKE_BATTERY_RC)
         self.assertIn(b"sleep 5", FAKE_BATTERY_RC)
+
+
+class PointerBridgeRcTest(unittest.TestCase):
+    def test_runs_the_vendor_binary_as_a_late_start_service(self):
+        self.assertIn(b"service vm-pointer-bridge /vendor/bin/vm-pointer-bridge\n", POINTER_BRIDGE_RC)
+        self.assertIn(b"    class late_start\n", POINTER_BRIDGE_RC)
+
+    def test_can_read_input_and_create_uinput_devices(self):
+        self.assertIn(b"    user root\n", POINTER_BRIDGE_RC)
+        self.assertIn(b"    group root input uhid\n", POINTER_BRIDGE_RC)
 
 
 if __name__ == "__main__":
