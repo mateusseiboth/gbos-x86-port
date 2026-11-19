@@ -9,6 +9,10 @@
 #include <linux/init.h>
 #include <linux/kdebug.h>
 #include <linux/uaccess.h>
+#include <linux/percpu.h>
+#include <linux/sched/signal.h>
+#include <linux/slab.h>
+#include <linux/task_work.h>
 #include <asm/ptrace.h>
 #include <asm/traps.h>
 
@@ -175,6 +179,10 @@ static unsigned long get_gpr(struct pt_regs *regs, int num)
  * bring a page in. Read with page faults disabled; a non-resident page just
  * fails the read (the caller then lets the normal SIGILL path run).
  */
+/* Last user range that could not be read, so the trap path can fault it in later. */
+static DEFINE_PER_CPU(unsigned long, gfni_fault_addr);
+static DEFINE_PER_CPU(size_t, gfni_fault_len);
+
 static int read_user_nofault(void *dst, unsigned long src, size_t len)
 {
 	unsigned long left;
@@ -182,7 +190,66 @@ static int read_user_nofault(void *dst, unsigned long src, size_t len)
 	pagefault_disable();
 	left = copy_from_user(dst, (const void __user *)src, len);
 	pagefault_enable();
-	return left ? -EFAULT : 0;
+	if (!left)
+		return 0;
+	this_cpu_write(gfni_fault_addr, src);
+	this_cpu_write(gfni_fault_len, len);
+	return -EFAULT;
+}
+
+/*
+ * A non-resident page (code or memory operand, e.g. a .rodata constant evicted under
+ * memory pressure) used to turn into SIGILL. Instead, fault the range in on the way back
+ * to user mode, where sleeping is allowed, and let the instruction trap again. A range
+ * that really is unmapped gets the SIGSEGV the hardware would have raised.
+ */
+struct gfni_faultin {
+	struct callback_head cb;
+	unsigned long addr;
+	size_t len;
+};
+
+static bool gfni_touch_user(unsigned long addr)
+{
+	uint8_t byte;
+
+	return !copy_from_user(&byte, (const void __user *)addr, 1);
+}
+
+static void gfni_faultin_fn(struct callback_head *cb)
+{
+	struct gfni_faultin *w = container_of(cb, struct gfni_faultin, cb);
+	unsigned long last = w->addr + w->len - 1;
+	unsigned long bad = 0;
+
+	if (!gfni_touch_user(w->addr))
+		bad = w->addr;
+	else if (!gfni_touch_user(last))
+		bad = last;
+	if (bad)
+		force_sig_fault(SIGSEGV, SEGV_MAPERR, (void __user *)bad);
+	kfree(w);
+}
+
+static bool gfni_queue_faultin(void)
+{
+	size_t len = this_cpu_read(gfni_fault_len);
+	struct gfni_faultin *w;
+
+	if (!len)
+		return false;
+	w = kmalloc(sizeof(*w), GFP_ATOMIC);
+	if (!w)
+		return false;
+	w->addr = this_cpu_read(gfni_fault_addr);
+	w->len = len;
+	init_task_work(&w->cb, gfni_faultin_fn);
+	if (task_work_add(current, &w->cb, TWA_RESUME)) {
+		kfree(w);
+		return false;
+	}
+	pr_info_ratelimited("gfni_emu: faulting in user range 0x%lx+%zu (pid %d)\n", w->addr, len, current->pid);
+	return true;
 }
 
 /*
@@ -501,6 +568,7 @@ __used noinline int real_gfni_die_handler(struct notifier_block *self, unsigned 
 		return NOTIFY_DONE;
 
 	orig_ip = regs->ip;
+	this_cpu_write(gfni_fault_len, 0);
 
 	if (emulate_unsupported_insn(regs, ymm)) {
 		emu_count++;
@@ -510,6 +578,10 @@ __used noinline int real_gfni_die_handler(struct notifier_block *self, unsigned 
 		}
 		return NOTIFY_STOP;
 	}
+
+	/* RIP is untouched, so the instruction traps again once the page is resident. */
+	if (gfni_queue_faultin())
+		return NOTIFY_STOP;
 
 	pr_warn("gfni_emu: Emulation failed for RIP=0x%lx\n", regs->ip);
 	return NOTIFY_DONE;
