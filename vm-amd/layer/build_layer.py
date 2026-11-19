@@ -15,14 +15,20 @@ Inputs (env, defaults under GBOS_ROOT):
   GBOS_LIBZ          baseline libz.so (vm-amd/zlib-build)
   GBOS_POINTER_BRIDGE  pointer-bridge/vm-pointer-bridge
   GBOS_FUTILITY_STUB   layer/stubs/out/futility (layer/stubs/build.sh)
+  GBOS_VENDOR_MODULES  combined /vendor/lib/modules (kernel/resolve_modules.py --vendor-out)
+  GBOS_FIRMWARE        firmware tree (kernel/collect_firmware.py), added under /vendor/firmware
 """
+import io
 import json
 import os
 import posixpath
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -33,6 +39,8 @@ PORT_IMAGE = Path(os.environ.get('GBOS_PORT_IMAGE', LINUX_DIR / 'image-security/
 LIBZ = Path(os.environ.get('GBOS_LIBZ', HERE.parent / 'zlib-build/out/libz.so'))
 POINTER_BRIDGE = Path(os.environ.get('GBOS_POINTER_BRIDGE', HERE.parents[1] / 'pointer-bridge/vm-pointer-bridge'))
 FUTILITY_STUB = Path(os.environ.get('GBOS_FUTILITY_STUB', HERE / 'stubs/out/futility'))
+VENDOR_MODULES = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
+FIRMWARE = Path(os.environ.get('GBOS_FIRMWARE', ROOT / 'dlkm/firmware'))
 SUPER_BASE = 1458176 * 512
 PARTITION_NAME = 'gbos_layer'
 
@@ -141,7 +149,54 @@ def odm_build_prop(overrides: dict) -> str:
     return header + ''.join(f'{k}={overrides[k]}\n' for k in sorted(overrides))
 
 
-NEW_DIR = (0o755, 0, 2000, 'vendor_file')  # directories the stock vendor does not have
+@dataclass(frozen=True)
+class Symlink:
+    target: str
+
+
+# Label of a directory the stock vendor does not have, by its top-level component.
+NEW_DIR_LABELS = {'firmware': 'vendor_firmware_file'}
+
+
+def new_dir_meta(rel: str):
+    return (0o755, 0, 2000, NEW_DIR_LABELS.get(rel.split('/')[0], 'vendor_file'))
+
+
+# ueventd, vendor_modprobe and init.insmod.sh may only load .ko files labeled vendor_kernel_modules.
+MODULE_LABELS = {'.ko': 'vendor_kernel_modules'}
+
+
+def module_label(rel: str) -> str:
+    return MODULE_LABELS.get(posixpath.splitext(rel)[1], 'vendor_file')
+
+
+def firmware_label(rel: str) -> str:
+    return 'vendor_firmware_file'
+
+
+def tree_entries(root: Path, label_of, skip=()):
+    """Layer file entries for a host directory tree; contents stay on disk until the tar is written."""
+    entries = {}
+    for d, _, names in os.walk(root):
+        for n in names:
+            path = Path(d) / n
+            rel = path.relative_to(root).as_posix()
+            if rel in skip:
+                continue
+            entries[rel] = ((Symlink(os.readlink(path)), 'vendor_file', 0o777, 0, 0) if path.is_symlink()
+                            else (path, label_of(rel), 0o644, 0, 0))
+    return entries
+
+
+def parse_erofs_ls(text: str) -> dict:
+    """{name: is_dir} from `dump.erofs --ls` output."""
+    rows = text.split('FILENAME', 1)[1].splitlines() if 'FILENAME' in text else []
+    out = {}
+    for row in rows:
+        f = row.split(None, 2)
+        if len(f) == 3 and f[2] not in ('.', '..'):
+            out[f[2]] = f[1] == '2'
+    return out
 
 
 def ancestor_dirs(files) -> set:
@@ -204,6 +259,27 @@ def port_files(port_fs: Path, stock_fs: Path):
     return files, overrides, contexts
 
 
+def stock_tree(fs: Path, rel: str) -> set:
+    """Every path below rel in a stock erofs image."""
+    out = subprocess.run(['dump.erofs', '--ls', f'--path=/{rel}', str(fs)], check=True,
+                         capture_output=True, text=True).stdout
+    paths = set()
+    for name, is_dir in parse_erofs_ls(out).items():
+        paths.add(f'{rel}/{name}')
+        paths |= stock_tree(fs, f'{rel}/{name}') if is_dir else set()
+    return paths
+
+
+def driver_files(stock_vendor: Path):
+    """Fedora-driver modules (in place of the /vendor/lib/modules symlink) and the firmware the
+    stock vendor does not already ship."""
+    modules = {f'lib/modules/{k}': v for k, v in tree_entries(VENDOR_MODULES, module_label).items()}
+    stock = stock_tree(stock_vendor, 'firmware')
+    firmware = {f'firmware/{k}': v for k, v in tree_entries(FIRMWARE, firmware_label, skip={'MISSING.txt'}).items()
+                if f'firmware/{k}' not in stock}
+    return {**modules, **firmware}
+
+
 def gbos_vendor_files(stock_vendor: Path, stock_system: Path):
     files = {
         'lib64/libz.so': _entry(stock_vendor, 'lib64/libz.so', LIBZ.read_bytes()),
@@ -237,17 +313,64 @@ def layer_dirs(vendor_files, stock_vendor: Path, stock_system: Path):
             'odm': (odm['mode'] & 0o7777, odm['uid'], odm['gid'], port._label(odm)),
             'odm/etc': (0o755, 0, 2000, 'vendor_configs_file'),
             'odm/etc/selinux': (0o755, 0, 0, 'vendor_configs_file')}
-    new_dirs ={d: NEW_DIR for d in sorted(ancestor_dirs(vendor_files)) if not port._exists(stock_vendor, d)}
+    # lib/modules is a symlink in the stock vendor: the layer's directory takes its place.
+    new_dirs = {d: new_dir_meta(d) for d in sorted(ancestor_dirs(vendor_files)) if not _is_stock_dir(stock_vendor, d)}
     for rel, meta in port.dir_entries(stock_vendor, vendor_files, new_dirs).items():
         dirs[layer_path('vendor', rel)] = meta
     return dirs
 
 
+def _is_stock_dir(fs: Path, rel: str) -> bool:
+    _, erofs_metadata, _ = _helpers()
+    try:
+        return stat.S_ISDIR(erofs_metadata.metadata(fs, '/' + rel)['mode'])
+    except Exception:
+        return False
+
+
+def _add_bytes(t, ti, data):
+    ti.size = len(data)
+    t.addfile(ti, io.BytesIO(data))
+
+
+def _add_path(t, ti, path):
+    ti.size = path.stat().st_size
+    with path.open('rb') as f:
+        t.addfile(ti, f)
+
+
+def _add_link(t, ti, link):
+    ti.type, ti.linkname = tarfile.SYMTYPE, link.target
+    t.addfile(ti)
+
+
+ADD_ENTRY = {bytes: _add_bytes, Path: _add_path, Symlink: _add_link}
+
+
+def write_tar(path: Path, dirs, files):
+    """The layer as a tarball for mkfs.erofs --tar, SELinux labels as xattrs; file data may be
+    bytes, a host Path (read while writing) or a Symlink."""
+    def info(name, mode, uid, gid, label):
+        ti = tarfile.TarInfo(name)
+        ti.mode, ti.uid, ti.gid, ti.mtime = mode & 0o7777, uid, gid, 1230768000
+        ti.pax_headers = {'SCHILY.xattr.security.selinux': f'u:object_r:{label}:s0'}
+        return ti
+    with tarfile.open(path, 'w', format=tarfile.PAX_FORMAT) as t:
+        for name, (mode, uid, gid, label) in dirs.items():
+            ti = info(name, mode, uid, gid, label)
+            ti.type = tarfile.DIRTYPE
+            t.addfile(ti)
+        for name, (data, label, mode, uid, gid) in files.items():
+            add = next(fn for kind, fn in ADD_ENTRY.items() if isinstance(data, kind))
+            add(t, info(name, mode, uid, gid, label), data)
+
+
 def build_erofs(dirs, files, out: Path, tmp: Path):
-    _, _, port = _helpers()
     tar = tmp / 'layer.tar'
-    port.overlay_tar(tar, dirs, files)
-    subprocess.run(['mkfs.erofs', '--tar=f', '-x1', str(out), str(tar)], check=True, capture_output=True)
+    write_tar(tar, dirs, files)
+    tar_mb = tar.stat().st_size >> 20
+    subprocess.run(['mkfs.erofs', '--tar=f', '-x1', '-zlz4hc', str(out), str(tar)], check=True, capture_output=True)
+    print(f'layer tar {tar_mb} MB -> erofs {out.stat().st_size >> 20} MB')
     subprocess.run(['fsck.erofs', str(out)], check=True, capture_output=True)
 
 
@@ -259,14 +382,14 @@ def build_disk(erofs: Path, disk: Path):
         f.truncate((2048 + part_sectors + 2048) * 512)
     subprocess.run(['sgdisk', '-o', '-n', f'1:2048:{2048 + part_sectors - 1}', '-c', f'1:{PARTITION_NAME}', str(disk)],
                    check=True, capture_output=True)
-    with disk.open('r+b') as f:
+    with disk.open('r+b') as f, erofs.open('rb') as src:
         f.seek(2048 * 512)
-        f.write(erofs.read_bytes())
+        shutil.copyfileobj(src, f, 16 << 20)
 
 
 def main():
     out = Path(sys.argv[1])
-    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE, FUTILITY_STUB):
+    for need in (STOCK_IMAGE, PORT_IMAGE, LIBZ, POINTER_BRIDGE, FUTILITY_STUB, VENDOR_MODULES, FIRMWARE):
         if not need.exists():
             raise SystemExit(f'missing {need}')
     tmp = Path(tempfile.mkdtemp(prefix='gbos-layer-', dir=out.parent))
@@ -275,7 +398,7 @@ def main():
         stock_system = extract_partition(STOCK_IMAGE, 'system_a', tmp / 'stock_system.erofs')
         port_vendor = extract_partition(PORT_IMAGE, 'vendor_a', tmp / 'port_vendor.erofs')
         pfiles, overrides, contexts = port_files(port_vendor, stock_vendor)
-        vendor = {**pfiles, **gbos_vendor_files(stock_vendor, stock_system)}
+        vendor = {**pfiles, **gbos_vendor_files(stock_vendor, stock_system), **driver_files(stock_vendor)}
         files = {layer_path('vendor', k): v for k, v in vendor.items()}
         files.update({layer_path('odm', k): v for k, v in odm_files(overrides, contexts).items()})
         build_erofs(layer_dirs(vendor, stock_vendor, stock_system), files, tmp / 'layer.erofs', tmp)

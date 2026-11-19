@@ -1,6 +1,11 @@
+import io
+import tarfile
+import tempfile
 import unittest
+from pathlib import Path
 
-from build_layer import FAKE_BATTERY_RC, added_lines, ancestor_dirs, layer_path, odm_build_prop, prop_overrides
+from build_layer import (FAKE_BATTERY_RC, Symlink, added_lines, ancestor_dirs, layer_path, module_label,
+                         new_dir_meta, odm_build_prop, parse_erofs_ls, prop_overrides, tree_entries, write_tar)
 
 
 class PropOverridesTest(unittest.TestCase):
@@ -67,6 +72,61 @@ class FakeBatteryTriggerTest(unittest.TestCase):
         # `cmd battery` until BatteryService answers.
         self.assertIn(b"on property:init.svc.zygote=running\n    start vm-fake-battery\n", FAKE_BATTERY_RC)
         self.assertNotIn(b"sys.boot_completed", FAKE_BATTERY_RC)
+
+
+
+class TreeEntriesTest(unittest.TestCase):
+    def test_files_are_read_lazily_and_links_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sub").mkdir()
+            (root / "sub" / "a.ko").write_bytes(b"ko")
+            (root / "modules.dep").write_text("a.ko:\n")
+            (root / "MISSING.txt").write_text("x\n")
+            (root / "g.ko").symlink_to("/vendor_dlkm/lib/modules/g.ko")
+            entries = tree_entries(root, module_label, skip={"MISSING.txt"})
+        self.assertEqual(entries["sub/a.ko"], (root / "sub" / "a.ko", "vendor_kernel_modules", 0o644, 0, 0))
+        self.assertEqual(entries["modules.dep"][1], "vendor_file")
+        self.assertEqual(entries["g.ko"], (Symlink("/vendor_dlkm/lib/modules/g.ko"), "vendor_file", 0o777, 0, 0))
+        self.assertNotIn("MISSING.txt", entries)
+
+
+class NewDirMetaTest(unittest.TestCase):
+    def test_firmware_directories_keep_the_firmware_label(self):
+        self.assertEqual(new_dir_meta("firmware/amdgpu"), (0o755, 0, 2000, "vendor_firmware_file"))
+
+    def test_other_directories_are_vendor_file(self):
+        self.assertEqual(new_dir_meta("lib/modules"), (0o755, 0, 2000, "vendor_file"))
+
+
+class ParseErofsLsTest(unittest.TestCase):
+    def test_names_and_directory_flags(self):
+        text = ("Path : /firmware\nSize: 899  On-disk size: 899  directory\n\n"
+                "       NID TYPE  FILENAME\n        321    2  .\n         51    2  ..\n"
+                "    3001461    1  regulatory.db\n       400    2  i915\n")
+        self.assertEqual(parse_erofs_ls(text), {"regulatory.db": False, "i915": True})
+
+
+class WriteTarTest(unittest.TestCase):
+    def test_dirs_bytes_files_and_links_carry_selinux_labels(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "fw.bin"
+            src.write_bytes(b"firmware")
+            out = Path(d) / "layer.tar"
+            write_tar(out, {"vendor": (0o755, 0, 2000, "vendor_file")}, {
+                "vendor/a.rc": (b"on boot\n", "vendor_configs_file", 0o644, 0, 0),
+                "vendor/firmware/fw.bin": (src, "vendor_firmware_file", 0o644, 0, 0),
+                "vendor/lib/modules/g.ko": (Symlink("/vendor_dlkm/lib/modules/g.ko"), "vendor_file", 0o777, 0, 0),
+            })
+            with tarfile.open(out) as t:
+                members = {m.name: m for m in t.getmembers()}
+                self.assertTrue(members["vendor"].isdir())
+                self.assertEqual(t.extractfile("vendor/a.rc").read(), b"on boot\n")
+                self.assertEqual(t.extractfile("vendor/firmware/fw.bin").read(), b"firmware")
+                link = members["vendor/lib/modules/g.ko"]
+                self.assertTrue(link.issym())
+                self.assertEqual(link.linkname, "/vendor_dlkm/lib/modules/g.ko")
+                self.assertEqual(link.pax_headers["SCHILY.xattr.security.selinux"], "u:object_r:vendor_file:s0")
 
 
 if __name__ == "__main__":

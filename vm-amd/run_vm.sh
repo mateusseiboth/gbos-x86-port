@@ -20,7 +20,7 @@ NAME="${1:-daily}"
 BASE="${GBOS_BASE:-$GBOS/vm/stock/googlebook.bin}"
 LAYER="${GBOS_LAYER:-$GBOS/vm/layer.img}"
 INITRD="${GBOS_INITRD:-$GBOS/vm/initrd}"
-KERNEL="${GBOS_KERNEL:-$GBOS/kernel/out/arch/x86/boot/bzImage}"
+KERNEL="${GBOS_KERNEL:-$GBOS/kernel/out-full/arch/x86/boot/bzImage}"
 OVERLAY="${GBOS_OVERLAY:-$GBOS/vm/data.qcow2}"
 LOG="$GBOS/vm/logs/$NAME"
 

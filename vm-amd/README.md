@@ -2,7 +2,9 @@
 
 Runs the lapis (x86_64) image under QEMU/KVM on a Ryzen 5 5600GT (Zen 3: VAES/VPCLMULQDQ present,
 **no GFNI, no AVX-VNNI**). Unlike `host/`, which uses Google's shipped kernel, this path builds AOSP
-`kernel/common` with `module/gfni_emu.c` **built in** (registered as a `core_initcall`, before `/init`).
+`kernel/common` with `module/gfni_emu.c` **built in** (registered as a `core_initcall`, before `/init`)
+and Fedora's hardware drivers as modules (`kernel/out-full`), which the layer ships together with
+Fedora's firmware.
 
 The image stays **stock**: `system_a` / `vendor_a` are byte-identical and dm-verity is on. Everything
 vm-amd changes lives in one erofs **layer** that the first-stage fstab mounts over `/vendor` and `/odm`.
@@ -13,7 +15,10 @@ Verified 2026-11-19: stock image + layer boots to the setup wizard (first boot ~
 through the pointer bridge, ~1.5–3k emulated instructions/s with the libz bind, no unsupported opcodes.
 **OTA end to end**: the wizard's 164 MB update downloaded and applied in ~8 min, the guest rebooted,
 `run_vm.sh` came back up on slot `_b` with the layer on top, setup continued with `/data` intact, and
-the boot-control HAL marked `_b` successful.
+the boot-control HAL marked `_b` successful. With the Fedora-driver kernel and the module layer the
+guest boots in ~80-95 s (fresh `/data`); ueventd loads Google's modules and ours from the combined index
+(`lpc_ich`, `iTCO_wdt`, `ahci`, `qemu_fw_cfg`, ... next to Google's `joydev`, `mac80211`), no CRC or
+SELinux failures.
 
 ## Layout (`GBOS_ROOT`, default `/mnt/dados/gbos`)
 
@@ -22,7 +27,9 @@ the boot-control HAL marked `_b` successful.
 | `$GBOS_ROOT/gbos-x86-port` | this repo (`vm-amd/` is symlinked as `$GBOS_ROOT/tuned`) |
 | `$GBOS_ROOT/gbos-vm-linux` | [chaitan3/gbos-vm-linux](https://github.com/chaitan3/gbos-vm-linux) checkout: recovery image, donor, guest Mesa, security-ported image (source of the layer's port files) |
 | `$GBOS_ROOT/kernel/common` | AOSP `kernel/common` @ `android17-6.18-2026-06_r52` (`3938c8d97142`) |
-| `$GBOS_ROOT/kernel/out` | VM kernel build (`KOUT` selects another, e.g. `out-full`) |
+| `$GBOS_ROOT/kernel/out` | GKI-config kernel build (the CRC reference for `out-full`) |
+| `$GBOS_ROOT/kernel/out-full` | kernel with Fedora's drivers: what `run_vm.sh` boots |
+| `$GBOS_ROOT/dlkm/` | `staging` (modules_install), `vendor-modules` (the layer's `/vendor/lib/modules`), `firmware` |
 | `$GBOS_ROOT/vm/stock/googlebook.bin` | stock recovery image with userdata grown to 16 GiB |
 | `$GBOS_ROOT/vm/layer.img` | the layer (GPT, partition `gbos_layer`), second NVMe namespace |
 | `$GBOS_ROOT/vm/initrd` | VM ramdisk with the layer entries in the first-stage fstab |
@@ -36,7 +43,7 @@ the boot-control HAL marked `_b` successful.
 | `kernel/patches/gbos-amd-vm.patch` | the whole kernel tree delta (gfni_emu, overlayfs caller creds, 0001) |
 | `kernel/fedora_drivers.py` | config fragment with Fedora's hardware drivers as modules, CRC-safe (see below) |
 | `kernel/collect_firmware.py` | stages linux-firmware uncompressed for the GKI kernel |
-| `kernel/resolve_modules.py` | picks ours or Google's for every module name both sides ship |
+| `kernel/resolve_modules.py` | picks ours or Google's for every module name both sides ship; writes the combined `/vendor/lib/modules` |
 | `zlib-build/build.sh` | `patches/build_libz.sh` pointed at a local AOSP `external/zlib` checkout |
 | `layer/build_layer.py` | builds `vm/layer.img` |
 | `boot/slot.py` | A/B selection from `misc` + vbmeta size/digest of the chosen slot |
@@ -76,8 +83,9 @@ KOUT=$GBOS_ROOT/kernel/out-full $GBOS_ROOT/tuned/kernel/kmake.sh olddefconfig
 python3 $GBOS_ROOT/tuned/kernel/fedora_drivers.py check ../out/.config ../out-full/.config         # expect "core unchanged"
 KOUT=$GBOS_ROOT/kernel/out-full $GBOS_ROOT/tuned/kernel/kmake.sh -j11 bzImage modules
 KOUT=$GBOS_ROOT/kernel/out-full $GBOS_ROOT/tuned/kernel/kmake.sh INSTALL_MOD_PATH=$GBOS_ROOT/dlkm/staging INSTALL_MOD_STRIP=1 modules_install
-python3 $GBOS_ROOT/tuned/kernel/resolve_modules.py $GBOS_ROOT/dlkm/staging/lib/modules/<release> <dirs with Google's .ko> \
-  --symvers ../out-full/Module.symvers --out $GBOS_ROOT/dlkm/modules.selection
+# Google's modules: vendor_dlkm_a / system_dlkm_a extracted under work/shipped-dlkm, the ramdisks' under work/shipped-ko
+python3 $GBOS_ROOT/tuned/kernel/resolve_modules.py $GBOS_ROOT/dlkm/staging $GBOS_ROOT/work/shipped-dlkm $GBOS_ROOT/work/shipped-ko \
+  --symvers ../out-full/Module.symvers --out $GBOS_ROOT/dlkm/modules.selection --vendor-out $GBOS_ROOT/dlkm/vendor-modules
 python3 $GBOS_ROOT/tuned/kernel/collect_firmware.py /lib/firmware $GBOS_ROOT/dlkm/firmware $GBOS_ROOT/dlkm/staging/lib/modules/<release>
 
 # image inputs: gbos-vm-linux README steps 1-6 (the security-ported image is only read by build_layer.py)
@@ -108,6 +116,16 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   postinstall step flashes the AP firmware with `futility update`; there is no SPI flash, and the real
   tool's failure made update_engine reject the whole update (`kPostinstallRunnerError`).
 * `vm-pointer-bridge` (usb-tablet -> clickable pointer + wheel) in its own SELinux domain.
+* **Drivers**: a `/vendor/lib/modules` directory in place of the stock symlink to
+  `/vendor_dlkm/lib/modules`. ueventd (modalias handling), `init.insmod.sh` and the vendor rc files all
+  read that path, so its index decides per name: our 3351 modules are files there, Google's 564 are named
+  by their real path (`/vendor_dlkm/lib/modules/x.ko`, `/system/lib/modules/x.ko`; libmodprobe opens
+  modules with `O_NOFOLLOW`, so links do not work). `modules.load` / `.blocklist` / `.options` are
+  Google's. `.ko` files are labeled `vendor_kernel_modules`, which the stock policy already lets
+  ueventd and the modprobe domains load.
+* **Firmware**: Fedora's linux-firmware under `/vendor/firmware` (`vendor_firmware_file`, the
+  `firmware_class.path`), except files the stock vendor already ships. The layer is lz4hc-compressed
+  (~770 MB).
 * `odm_sepolicy.cil` (that domain, the libz bind) plus a placeholder `/odm/etc/selinux/precompiled_sepolicy`:
   without its `.sha256` sidecars init skips the precompiled policy and compiles the CIL files, ours
   included (`secilc -N`, so no neverallow checks).
@@ -141,7 +159,13 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   a module counts as loadable only if every need is met by modules that load (fixpoint). Result on the
   lapis build: 3958 names, 20 use ours (`cfg80211`, `iwlwifi`/`iwlmvm`/`iwlmld`, `drm_ttm_helper`, `ptp`,
   `rust_binder`, ...), 36 of ours dropped (niche Bluetooth, Qualcomm codecs, `cs8409`, AMD SOF/ACP: the
-  SOF core stays Google's because its Intel SOF drivers depend on it). Output: `dlkm/modules.selection`.
+  SOF core stays Google's because its Intel SOF drivers depend on it). Output: `dlkm/modules.selection`
+  and, with `--vendor-out`, the layer's `/vendor/lib/modules`. That index is built from the vendor_dlkm
+  the layer was made for: after an OTA that changes Google's module set, rerun the resolver and
+  `build_layer.py` (an unchanged set keeps working, since the index names files, not contents).
+* Modules load only after switch_root (ueventd). Storage/USB controllers that must exist before that
+  (`ahci`, NVMe is built in) work in the VM because the disk is NVMe; a real-PC image needs them in the
+  first-stage ramdisk.
 * Firmware: `collect_firmware.py` stages Fedora's linux-firmware (7404 entries, 1.1 GB uncompressed);
   476 names declared by modules are not packaged by Fedora (mostly NVIDIA, DVB, legacy b43/Broadcom).
 * `TRIM_UNUSED_KSYMS` off (Google's KMI list is not public). `WERROR` / `OBJTOOL_WERROR` off (Fedora's

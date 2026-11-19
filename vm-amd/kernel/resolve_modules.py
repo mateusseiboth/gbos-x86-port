@@ -11,6 +11,7 @@ follow). Google's modules are never dropped. Writes "<side> <name>" lines plus "
 """
 import argparse
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -72,24 +73,90 @@ def _switch_candidates(cands, chosen, dropped, broken):
     return sorted(providers | replaceable)
 
 
-def resolve(mods, kernel):
-    """(chosen side per name, names of ours that had to be dropped)."""
+def _candidates(mods):
     cands = {}
     for m in mods:
         cands.setdefault(m.name, {})[m.side] = m
+    return cands
+
+
+def resolve(mods, kernel):
+    """(chosen side per name, names of ours that had to be dropped)."""
+    cands = _candidates(mods)
     chosen = {n: 'google' if 'google' in c else 'ours' for n, c in cands.items()}
     dropped = set()
     while True:
         broken = _broken(cands, chosen, dropped, kernel)
-        switch = next((n for n in _switch_candidates(cands, chosen, dropped, broken)
-                       if _improves(n, cands, chosen, dropped, kernel, broken)), None)
-        if switch:
-            chosen[switch] = _other(chosen[switch])
+        flip = next((n for n in _switch_candidates(cands, chosen, dropped, broken)
+                     if _improves(n, cands, chosen, dropped, kernel, broken)), None)
+        if flip:
+            chosen[flip] = _other(chosen[flip])
             continue
         ours_broken = {n for n in broken if chosen[n] == 'ours'}
         if not ours_broken:
             return chosen, dropped
         dropped.update(ours_broken)
+
+
+# ---- /vendor/lib/modules ----------------------------------------------------------------
+
+def _load_order(name, direct, seen):
+    """Dependencies of name, each after its own dependencies (post-order)."""
+    order = []
+    for dep in direct.get(name, ()):
+        if dep not in seen:
+            seen.add(dep)
+            order += _load_order(dep, direct, seen) + [dep]
+    return order
+
+
+def build_modules_dep(mods, chosen, dropped, kernel, device_paths):
+    """modules.dep for the combined /vendor/lib/modules.
+
+    Our modules are files of that directory (relative names); Google's are named by their real
+    path, since libmodprobe opens modules with O_NOFOLLOW. A Google module without a device path
+    sits in the first-stage ramdisk and is already loaded. libmodprobe inserts a line's
+    dependencies from last to first, so they are listed in reverse load order.
+    """
+    cands = _candidates(mods)
+    active = {n: cands[n][side] for n, side in chosen.items() if n not in dropped}
+    provider = {}
+    for name, m in active.items():
+        for sym in m.exports:
+            provider.setdefault(sym, name)
+    direct = {n: sorted({provider[s] for s in m.needs if s not in kernel and s in provider} - {n})
+              for n, m in active.items()}
+    path = {n: n if chosen[n] == 'ours' else device_paths.get(n) for n in active}
+    lines = [' '.join([f'{path[name]}:'] + [path[d] for d in reversed(_load_order(name, direct, {name})) if path[d]])
+             for name in sorted(n for n in active if path[n])]
+    return ''.join(line + '\n' for line in lines)
+
+
+def _canonical(name):
+    return name.removesuffix('.ko').replace('-', '_')
+
+
+# Which field of a modules.alias / modules.softdep line names the module.
+MODULE_FIELD = {'alias': lambda f: f[-1], 'softdep': lambda f: f[1]}
+
+
+def filter_module_lines(text, names):
+    """depmod's alias/softdep lines that belong to one of names."""
+    wanted = {_canonical(n) for n in names}
+    keep = [line for line in text.splitlines()
+            if (f := line.split()) and f[0] in MODULE_FIELD and _canonical(MODULE_FIELD[f[0]](f)) in wanted]
+    return ''.join(line + '\n' for line in keep)
+
+
+# Extracted partition -> the directory Google's own modules.dep uses for it.
+DEVICE_MODULE_DIRS = {'vendor_dlkm_a': '/vendor_dlkm/lib/modules', 'system_dlkm_a': '/system/lib/modules'}
+
+
+def device_path(path):
+    """Where a shipped module lives on the device; None for the first-stage ramdisk ones."""
+    parts = Path(path).parts
+    part = next((p for p in parts if p in DEVICE_MODULE_DIRS), None)
+    return part and f'{DEVICE_MODULE_DIRS[part]}/{parts[-1]}'
 
 
 # ---- reading .ko files ---------------------------------------------------------------------
@@ -145,11 +212,13 @@ def main():
     ap.add_argument('google', nargs='+')
     ap.add_argument('--symvers', required=True)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--vendor-out', help='also write the combined /vendor/lib/modules tree')
     a = ap.parse_args()
     ours = find_modules(a.ours)
     google = [f for d in a.google for f in find_modules(d)]
     mods = [read_module(f, 'ours') for f in ours] + [read_module(f, 'google') for f in google]
-    chosen, dropped = resolve(mods, read_kernel_exports(a.symvers))
+    kernel = read_kernel_exports(a.symvers)
+    chosen, dropped = resolve(mods, kernel)
     lines = [f'{side} {name}' for name, side in sorted(chosen.items()) if name not in dropped]
     lines += [f'dropped {name}' for name in sorted(dropped)]
     Path(a.out).write_text('\n'.join(lines) + '\n')
@@ -157,6 +226,42 @@ def main():
     switched = sorted(n for n in shared if chosen[n] == 'ours')
     print(f'{len(chosen)} names, {len(shared)} shared ({len(switched)} use ours: {switched}), '
           f'{len(dropped)} dropped: {sorted(dropped)}')
+    if a.vendor_out:
+        write_vendor_modules(Path(a.vendor_out), a.ours, ours, google, mods, chosen, dropped, kernel)
+
+
+# Google's index files that are copied as they are (names only, no paths).
+GOOGLE_INDEX_COPIES = ('modules.load', 'modules.blocklist', 'modules.options')
+
+
+def write_vendor_modules(out, ours_root, ours, google, mods, chosen, dropped, kernel):
+    """The directory the layer puts in place of the stock /vendor/lib/modules symlink.
+
+    Every reader (ueventd's modalias handling, init.insmod.sh, vendor rc files) goes through
+    /vendor/lib/modules, so one index decides between Google's module and ours for each name.
+    """
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    ours_sel = {n for n, side in chosen.items() if side == 'ours' and n not in dropped}
+    for f in ours:
+        if os.path.basename(f) in ours_sel:
+            os.link(f, out / os.path.basename(f))
+    paths = {os.path.basename(f): device_path(f) for f in google if device_path(f)}
+    google_sel = {n for n in paths if chosen[n] == 'google'}
+    (out / 'modules.dep').write_text(build_modules_dep(mods, chosen, dropped, kernel, paths))
+    depmod_dir = Path(next(d for d, _, files in os.walk(ours_root) if 'modules.alias' in files))
+    google_dirs = sorted({os.path.dirname(f) for f in google if device_path(f)})
+    for index in ('modules.alias', 'modules.softdep'):
+        theirs = ''.join(filter_module_lines(_read(Path(d) / index), google_sel) for d in google_dirs)
+        (out / index).write_text(theirs + filter_module_lines((depmod_dir / index).read_text(), ours_sel))
+    vendor_dir = next(d for d in google_dirs if 'vendor_dlkm' in d)
+    for index in GOOGLE_INDEX_COPIES:
+        (out / index).write_text(_read(Path(vendor_dir) / index))
+    print(f'{out}: {len(ours_sel)} of ours, {len(google_sel)} of Google\'s by path')
+
+
+def _read(path):
+    return path.read_text() if path.exists() else ''
 
 
 if __name__ == '__main__':

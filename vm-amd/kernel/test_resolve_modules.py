@@ -1,6 +1,6 @@
 import unittest
 
-from resolve_modules import Module, resolve
+from resolve_modules import Module, build_modules_dep, device_path, filter_module_lines, resolve
 
 
 def mod(name, side, exports=None, needs=None):
@@ -92,6 +92,55 @@ class ResolveTest(unittest.TestCase):
         chosen, dropped = resolve(mods, kernel={})
         self.assertEqual(chosen["g.ko"], "google")
         self.assertEqual(dropped, set())
+
+
+class VendorModulesTest(unittest.TestCase):
+    def test_modules_dep_lists_transitive_deps_in_reverse_load_order(self):
+        mods = [
+            mod("base.ko", "google", {"b": 1}),
+            mod("mid.ko", "ours", {"m": 1}, needs={"b": 1}),
+            mod("top.ko", "ours", needs={"m": 1, "b": 1, "k": 1}),
+            mod("ram.ko", "google", {"r": 1}),  # first-stage ramdisk only: already loaded, no file
+            mod("leaf.ko", "ours", needs={"r": 1}),
+        ]
+        chosen, dropped = resolve(mods, kernel={"k": 1})
+        # libmodprobe opens modules with O_NOFOLLOW: Google's are named by their real path.
+        base = "/vendor_dlkm/lib/modules/base.ko"
+        text = build_modules_dep(mods, chosen, dropped, {"k": 1}, {"base.ko": base})
+        self.assertEqual(text, f"{base}:\n"
+                               "leaf.ko:\n"
+                               f"mid.ko: {base}\n"
+                               f"top.ko: mid.ko {base}\n")
+
+    def test_switched_names_resolve_to_our_module(self):
+        mods = [
+            mod("cfg80211.ko", "google", {"c": 1}, needs={"net_ns": 1}),
+            mod("cfg80211.ko", "ours", {"c": 2}, needs={"net_ns": 2}),
+            mod("iwlmvm.ko", "ours", needs={"c": 2}),
+        ]
+        chosen, dropped = resolve(mods, kernel={"net_ns": 2})
+        text = build_modules_dep(mods, chosen, dropped, {"net_ns": 2},
+                                 {"cfg80211.ko": "/vendor_dlkm/lib/modules/cfg80211.ko"})
+        self.assertEqual(text, "cfg80211.ko:\niwlmvm.ko: cfg80211.ko\n")
+
+    def test_dropped_modules_get_no_line(self):
+        mods = [mod("a.ko", "ours", needs={"missing": 1})]
+        chosen, dropped = resolve(mods, kernel={})
+        self.assertEqual(build_modules_dep(mods, chosen, dropped, {}, {}), "")
+
+    def test_alias_and_softdep_lines_are_kept_for_selected_modules_only(self):
+        text = ("# Aliases extracted from modules themselves.\n"
+                "alias pci:v1 e1000e\nalias pci:v2 snd_hda_intel\nalias usb:x foo_bar\n"
+                "softdep snd_hda_intel pre: snd_hda_codec\nsoftdep foo_bar post: e1000e\n")
+        self.assertEqual(filter_module_lines(text, {"e1000e.ko", "foo-bar.ko"}),
+                         "alias pci:v1 e1000e\nalias usb:x foo_bar\nsoftdep foo_bar post: e1000e\n")
+
+    def test_device_path_of_shipped_modules(self):
+        self.assertEqual(device_path("/w/shipped-dlkm/vendor_dlkm_a/lib/modules/x.ko"),
+                         "/vendor_dlkm/lib/modules/x.ko")
+        self.assertEqual(device_path("/w/shipped-dlkm/system_dlkm_a/lib/modules/y.ko"),
+                         "/system/lib/modules/y.ko")
+        self.assertIsNone(device_path("/w/shipped-ko/initrd/lib/modules/z.ko"))
 
 
 if __name__ == "__main__":
