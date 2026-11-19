@@ -129,6 +129,12 @@ python3 $GBOS_ROOT/tuned/boot/initrd.py $GBOS_ROOT/gbos-vm-linux/initrd $GBOS_RO
   SurfaceFlinger aborted importing a gralloc buffer (`vkGetMemoryResourcePropertiesMESA`, invalid
   res_id) and the guest boot-looped. `virgl/external-egl-gbm.patch` creates the GBM device in that mode
   too, and `VIRGL_GBM_LAYOUT_FORCE_ENABLE=1` allocates shared/scanout buffers through it.
+  **Experimental, does not boot yet**: Venus no longer goes fatal, but SurfaceFlinger still aborts
+  (`Failed to create a valid texture`): app/SystemUI buffers are plain texture + render-target
+  resources, not GBM-allocated, and even GBM-allocated ones would need the guest (minigbm, stride
+  `width * 4`) and the host (amdgpu, 256-byte pitch) to agree on the layout, which the virgl path has
+  no channel for (ChromeOS uses `RESOURCE_INFO_CROS` + crosvm). The real fix is gfxstream through
+  rutabaga (Fedora's rutabaga is built without it) with Cuttlefish's guest graphics stack.
 * Baseline `libz.so` for `/vendor/lib64`, and for `/system/lib64` through a bind mount at `early-init`:
   `/system` cannot be overlaid on a user build (fs_mgr allowlist).
 * Boot animation: the stock one fades to black after ~5 s (enough for a real Googlebook); the layer's
