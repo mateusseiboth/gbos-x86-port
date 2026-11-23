@@ -12,7 +12,8 @@ Boot: firmware -> BOOTX64.EFI -> gbos-boot (A/B slot from misc, vbmeta) -> kexec
 Secure Boot must be off (nothing here is signed).
 
 Inputs (env, defaults under GBOS_ROOT): GBOS_STOCK_IMAGE (vm/stock/googlebook.bin), GBOS_LAYER
-(vm/layer.img), GBOS_KERNEL (kernel/out-full bzImage), GBOS_INITRD (vm/initrd), GBOS_STAGE1_KERNEL
+(vm/layer.img), GBOS_KERNEL (kernel/out-full bzImage), GBOS_INITRD (vm/initrd, plus simpledrm from
+GBOS_VENDOR_MODULES, dlkm/vendor-modules), GBOS_STAGE1_KERNEL
 (/boot/vmlinuz-$(uname -r)) and its modules (/lib/modules/<release>).
 """
 import argparse
@@ -126,6 +127,46 @@ def build_stage1_initramfs(out, kernel, initrd, cmdline, modules_dir, tmp):
                        check=True)
 
 
+# ---- Android first stage ------------------------------------------------------------------
+
+# Our kernel has no built-in driver for the firmware framebuffer (simpledrm is a module): without it
+# the screen stays on gbos-boot's last line until amdgpu loads. Listed dependencies first.
+FIRST_STAGE_MODULES = ('drm_client_lib.ko', 'drm_sysfb_helper.ko', 'simpledrm.ko')
+RAMDISK_MODULES = 'lib/modules'
+REGULAR = 0o100644
+
+
+def add_first_stage_modules(entries, modules):
+    """entries: ramdisk cpio entries; modules: {name: (bytes, [dependency names])}, in load order."""
+    def append(name, text):
+        mode, data = entries[f'{RAMDISK_MODULES}/{name}']
+        entries[f'{RAMDISK_MODULES}/{name}'] = (mode, data + text.encode())
+
+    for name, (blob, deps) in modules.items():
+        entries[f'{RAMDISK_MODULES}/{name}'] = (REGULAR, blob)
+        append('modules.load', f'{name}\n')
+        append('modules.dep', f'/{RAMDISK_MODULES}/{name}:' + ''.join(f' /{RAMDISK_MODULES}/{d}' for d in deps) + '\n')
+    return entries
+
+
+def read_module_deps(ko):
+    names = subprocess.run(['modinfo', '-F', 'depends', str(ko)], capture_output=True, text=True,
+                           check=True).stdout.strip()
+    return [f'{n}.ko' for n in names.split(',') if n]
+
+
+def build_android_initrd(out, initrd, modules_dir):
+    import sys
+    sys.path.insert(0, os.environ.get('GBOS_LINUX_DIR', str(ROOT / 'gbos-vm-linux')))
+    import cpio_tools
+    cpio = subprocess.run(['lz4', '-d', '-c', str(initrd)], check=True, capture_output=True).stdout
+    modules = {name: ((modules_dir / name).read_bytes(), read_module_deps(modules_dir / name))
+               for name in FIRST_STAGE_MODULES}
+    entries = add_first_stage_modules(cpio_tools.read(cpio), modules)
+    with open(out, 'wb') as f:
+        subprocess.run(['lz4', '-l', '-c'], input=cpio_tools.write(entries), stdout=f, check=True)
+
+
 def build_uki(out, stage1_kernel, initramfs):
     # rdinit=/init: gbos-boot; quiet keeps the screen for its messages.
     subprocess.run(['ukify', 'build', f'--linux={stage1_kernel}', f'--initrd={initramfs}',
@@ -195,7 +236,8 @@ def main():
     initrd = Path(os.environ.get('GBOS_INITRD', ROOT / 'vm/initrd'))
     stage1_kernel = Path(os.environ.get('GBOS_STAGE1_KERNEL', f'/boot/vmlinuz-{release}'))
     modules = Path(os.environ.get('GBOS_STAGE1_MODULES', f'/lib/modules/{release}'))
-    for need in (stock, layer, kernel, initrd, stage1_kernel, modules):
+    vendor_modules = Path(os.environ.get('GBOS_VENDOR_MODULES', ROOT / 'dlkm/vendor-modules'))
+    for need in (stock, layer, kernel, initrd, stage1_kernel, modules, vendor_modules):
         if not need.exists():
             raise SystemExit(f'missing {need}')
 
@@ -207,7 +249,8 @@ def main():
                                      os.environ.get('GBOS_CMDLINE_EXTRA', '')]))
     tmp = Path(tempfile.mkdtemp(prefix='gbos-usb-', dir=a.out.parent))
     try:
-        build_stage1_initramfs(tmp / 'stage1.cpio', kernel, initrd, cmdline, modules, tmp)
+        build_android_initrd(tmp / 'android.initrd', initrd, vendor_modules)
+        build_stage1_initramfs(tmp / 'stage1.cpio', kernel, tmp / 'android.initrd', cmdline, modules, tmp)
         build_uki(tmp / 'BOOTX64.EFI', stage1_kernel, tmp / 'stage1.cpio')
         build_esp(tmp / 'esp.img', tmp / 'BOOTX64.EFI')
         write_image(a.out, parts, disk_sectors, stock, tmp / 'esp.img', layer)

@@ -144,9 +144,12 @@ kexec (adding it changes the core and breaks module CRCs), Fedora's does. gbos-b
 a `gbos_layer` partition, picks the A/B slot from misc (spending a try on an unverified slot, as
 `boot/slot.py` does for the VM), measures vbmeta, detects the GPU stack and whether a battery exists,
 and kexecs our kernel with the Android ramdisk and a command line made of `boot/cmdline.txt` plus
-`androidboot.slot_suffix`, `vbmeta.*`, `boot_devices` (the disk controller's PCI path),
+`androidboot.slot_suffix`, `vbmeta.*`, `boot_devices` (the host bridge and first PCI device above
+the disk, e.g. `pci0000:00/0000:00:08.1`: the two components Android's first stage compares),
 `androidboot.gbos.gpu` and `androidboot.gbos.battery`. `GBOS_CMDLINE_EXTRA` appends arguments for
-debugging (an `androidboot.gbos.*` given there wins over detection).
+debugging (an `androidboot.gbos.*` given there wins over detection). The Android ramdisk on the stick also
+loads `simpledrm` in the first stage, so the kernel log shows on the firmware framebuffer from the
+kexec until the GPU driver takes over.
 
 Image layout (`usb/build_usb.py`): ESP (`GBOS-EFI`, 256 MiB), every stock partition except userdata in
 its original order (names, type/unique GUIDs and attributes kept; Android finds them by name), the

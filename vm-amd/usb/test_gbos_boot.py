@@ -86,12 +86,22 @@ class GbosBootPlanTest(unittest.TestCase):
         make_disk(disk, b"\0" * 32, vbmeta(1, 1, 1), vbmeta(1, 1, 2))
         self.assertEqual(self.plan(disk)["SLOT"], "_a")
 
-    def test_boot_device_is_the_pci_path_of_the_disk_controller(self):
-        # androidboot.boot_devices: first stage links /dev/block/by-name for disks below this path.
-        out = subprocess.run([str(self.exe), "--boot-device",
-                              "/sys/devices/pci0000:00/0000:00:08.1/0000:0a:00.3/usb4/4-2/4-2:1.0/host0/"
-                              "target0:0:0/0:0:0:0/block/sda"], capture_output=True, text=True, check=True)
-        self.assertEqual(out.stdout.strip(), "pci0000:00/0000:00:08.1/0000:0a:00.3")
+    def boot_device(self, syspath):
+        return subprocess.run([str(self.exe), "--boot-device", syspath], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def test_boot_device_is_the_root_port_above_the_disk(self):
+        # androidboot.boot_devices: first stage (init/devices.cpp FindPciDevicePrefix) links
+        # /dev/block/by-name for disks whose path starts with pciDDDD:BB/<first PCI device>; anything
+        # deeper (a controller behind a bridge, as on Ryzen) is not compared.
+        self.assertEqual(self.boot_device(
+            "/sys/devices/pci0000:00/0000:00:08.1/0000:06:00.3/usb4/4-1/4-1:1.0/host6/"
+            "target6:0:0/6:0:0:0/block/sdc"), "pci0000:00/0000:00:08.1")
+
+    def test_boot_device_of_a_controller_on_the_root_bus(self):
+        self.assertEqual(self.boot_device(
+            "/sys/devices/pci0000:00/0000:00:04.0/usb2/2-1/2-1:1.0/host0/target0:0:0/0:0:0:0/block/sda"),
+            "pci0000:00/0000:00:04.0")
 
 
 def pci(root, slot, vendor, cls):

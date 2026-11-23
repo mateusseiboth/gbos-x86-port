@@ -230,27 +230,17 @@ static int make_plan(struct disk *d, int write_back, struct plan *out)
 	return 0;
 }
 
-/* "/sys/devices/pci0000:00/0000:00:14.0/usb2/..." -> "pci0000:00/0000:00:14.0": the deepest PCI
- * device on the path, i.e. the disk's controller. */
+/* "/sys/devices/pci0000:00/0000:00:08.1/0000:06:00.3/usb4/..." -> "pci0000:00/0000:00:08.1": the
+ * host bridge and the first PCI device below it, the two components Android's first stage keeps
+ * (init/devices.cpp FindPciDevicePrefix) when it decides which disk gets /dev/block/by-name. */
 static int boot_device(const char *syspath, char *out, size_t outlen)
 {
-	const char *p = strstr(syspath, "/devices/");
+	const char *p = strstr(syspath, "/devices/pci");
 	if (!p)
 		return -1;
 	p += strlen("/devices/");
-	const char *end = NULL, *seg = p;
-	while (*seg) {
-		const char *next = strchr(seg, '/');
-		size_t len = next ? (size_t)(next - seg) : strlen(seg);
-		/* PCI functions look like 0000:00:14.0 (dddd:bb:dd.f) */
-		if (len == 12 && seg[4] == ':' && seg[7] == ':' && seg[10] == '.')
-			end = seg + len;
-		else if (!strncmp(seg, "pci", 3) && !end)
-			end = seg + len;
-		if (!next)
-			break;
-		seg = next + 1;
-	}
+	const char *bridge_end = strchr(p, '/');
+	const char *end = bridge_end ? strchr(bridge_end + 1, '/') : NULL;
 	if (!end || (size_t)(end - p) >= outlen)
 		return -1;
 	memcpy(out, p, (size_t)(end - p));

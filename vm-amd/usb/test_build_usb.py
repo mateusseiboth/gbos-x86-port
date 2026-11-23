@@ -1,6 +1,6 @@
 import unittest
 
-from build_usb import ESP_TYPE, Part, android_cmdline, layout
+from build_usb import ESP_TYPE, Part, add_first_stage_modules, android_cmdline, layout
 
 MIB = 2048  # sectors
 
@@ -59,6 +59,38 @@ class AndroidCmdlineTest(unittest.TestCase):
         # boot/cmdline.txt is shared with run_vm.sh, which adds the serial console instead.
         self.assertEqual(android_cmdline("panic=0\nbinder.impl=rust # comment\n# whole line\n"),
                          "console=ttyS0,115200 console=tty0 panic=0 binder.impl=rust")
+
+
+
+class FirstStageModulesTest(unittest.TestCase):
+    # The kexec'd kernel has no built-in driver for the firmware framebuffer: without simpledrm in
+    # the first stage the screen freezes on gbos-boot's last line until amdgpu loads (or forever).
+    REG = 0o100644
+    RAMDISK = {
+        "lib/modules/virtio_blk.ko": (REG, b"blk"),
+        "lib/modules/modules.load": (REG, b"virtio_blk.ko\n"),
+        "lib/modules/modules.dep": (REG, b"/lib/modules/virtio_blk.ko:\n"),
+    }
+
+    def add(self):
+        return add_first_stage_modules(dict(self.RAMDISK), {
+            "drm_sysfb_helper.ko": (b"helper", []),
+            "simpledrm.ko": (b"simple", ["drm_sysfb_helper.ko"]),
+        })
+
+    def test_modules_are_copied_into_the_ramdisk(self):
+        entries = self.add()
+        self.assertEqual(entries["lib/modules/simpledrm.ko"], (self.REG, b"simple"))
+        self.assertEqual(entries["lib/modules/virtio_blk.ko"], (self.REG, b"blk"))
+
+    def test_modules_are_loaded_after_the_stock_ones(self):
+        self.assertEqual(self.add()["lib/modules/modules.load"][1],
+                         b"virtio_blk.ko\ndrm_sysfb_helper.ko\nsimpledrm.ko\n")
+
+    def test_dependencies_use_ramdisk_paths(self):
+        self.assertEqual(self.add()["lib/modules/modules.dep"][1],
+                         b"/lib/modules/virtio_blk.ko:\n/lib/modules/drm_sysfb_helper.ko:\n"
+                         b"/lib/modules/simpledrm.ko: /lib/modules/drm_sysfb_helper.ko\n")
 
 
 if __name__ == "__main__":
